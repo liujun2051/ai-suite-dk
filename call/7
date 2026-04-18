@@ -1,0 +1,80 @@
+# xunfei_duplex_service.py
+import asyncio
+import websockets
+import json
+import base64
+
+class XunfeiDuplexService:
+    """讯飞超拟人交互API封装"""
+    
+    def __init__(self, app_id: str, api_key: str, api_secret: str):
+        self.app_id = app_id
+        self.api_key = api_key
+        self.api_secret = api_secret
+        self.ws_url = "wss://ws-api.xfyun.cn/v2/ai-super-speak"
+        
+    async def connect(self, character_id: str = "default"):
+        """连接讯飞全双工语音服务"""
+        # 构建认证参数
+        auth_params = self._build_auth_params()
+        
+        self.websocket = await websockets.connect(
+            f"{self.ws_url}?{auth_params}"
+        )
+        
+        # 发送初始化消息（人设配置）
+        await self.websocket.send(json.dumps({
+            "header": {"app_id": self.app_id},
+            "payload": {
+                "character": {
+                    "encoding": "utf8",
+                    "compress": "raw",
+                    "format": "json",
+                    "status": 0,
+                    "data": base64.b64encode(
+                        json.dumps({
+                            "character_id": character_id,
+                            "emotion": "friendly",
+                            "speed": 1.0
+                        }).encode()
+                    ).decode()
+                }
+            }
+        }))
+    
+    async def send_audio(self, audio_bytes: bytes):
+        """发送用户音频（16kHz PCM）"""
+        await self.websocket.send(json.dumps({
+            "header": {"app_id": self.app_id},
+            "payload": {
+                "audio": {
+                    "encoding": "lame",
+                    "sample_rate": 16000,
+                    "channels": 1,
+                    "bit_depth": 16,
+                    "data": base64.b64encode(audio_bytes).decode()
+                }
+            }
+        }))
+    
+    async def receive_audio(self):
+        """接收AI生成的音频响应"""
+        async for message in self.websocket:
+            data = json.loads(message)
+            if "audio" in data.get("payload", {}):
+                audio_b64 = data["payload"]["audio"]["data"]
+                yield base64.b64decode(audio_b64)
+
+
+
+# 在之前的 Pipecat pipeline 中
+from xunfei_duplex_service import XunfeiDuplexService
+
+# 替换 PersonaPlexLLMService 为讯飞服务
+xunfei = XunfeiDuplexService(
+    app_id="your_app_id",
+    api_key="your_api_key", 
+    api_secret="your_api_secret"
+)
+
+# 注意：讯飞是API服务，无需本地GPU，直接通过WebSocket对接                
