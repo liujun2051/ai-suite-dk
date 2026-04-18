@@ -1,0 +1,239 @@
+FreeSWITCH → Pipecat (Transport Layer) → PersonaPlex (作为 LLM 服务)
+                    ↓
+              Pipecat 负责：
+              - WebSocket 音频流收发
+              - VAD 语音活动检测
+              - Turn-taking 对话轮次管理
+              - 与 FreeSWITCH 的 SIP 对接
+              - 可选：Function Calling、上下文管理
+
+PersonaPlex 负责：
+              - 语音→语音的端到端生成
+              - 角色扮演和声音控制
+              - 低延迟的实时响应
+
+
+💻 完整代码实现：Pipecat + PersonaPlex
+以下是将 PersonaPlex 作为 Pipecat 中一个服务组件的完整实现：
+
+1. 自定义 PersonaPlexLLMService
+
+# personaplex_llm_service.py
+import asyncio
+import json
+import websockets
+from pipecat.frames.frames import (
+    Frame, 
+    TextFrame, 
+    OutputAudioRawFrame,
+    InterruptionFrame,
+    StartInterruptionFrame,
+    StopInterruptionFrame
+)
+from pipecat.services.llm_service import LLMService
+from pipecat.processors.frame_processor import FrameDirection
+
+class PersonaPlexLLMService(LLMService):
+    """将 PersonaPlex 作为 Pipecat 的 LLM 服务组件"""
+    
+    def __init__(
+        self,
+        websocket_url: str = "ws://localhost:8998/ws",
+        voice_prompt: str = "NATF2",
+        system_prompt: str = None,
+        sample_rate: int = 16000,
+        **kwargs
+    ):
+        super().__init__(**kwargs)
+        self._ws_url = websocket_url
+        self._voice_prompt = voice_prompt
+        self._system_prompt = system_prompt or self._get_default_prompt()
+        self._sample_rate = sample_rate
+        self._websocket = None
+        self._receive_task = None
+        self._is_interrupted = False
+        
+    def _get_default_prompt(self):
+        return """You are a friendly customer service agent. 
+                  Keep responses short and conversational (max 2 sentences).
+                  Answer questions clearly and helpfully."""
+    
+    async def _connect_websocket(self):
+        """连接到 PersonaPlex WebSocket 服务"""
+        self._websocket = await websockets.connect(self._ws_url)
+        
+        # 发送初始化配置
+        init_msg = {
+            "type": "init",
+            "voice": self._voice_prompt,
+            "prompt": self._system_prompt,
+            "tempText": 0.7,
+            "topkText": 50,
+            "topkAudio": 100
+        }
+        await self._websocket.send(json.dumps(init_msg))
+        print(f"[PersonaPlex] Connected and initialized with voice: {self._voice_prompt}")
+        
+        # 启动接收任务
+        self._receive_task = asyncio.create_task(self._receive_loop())
+    
+    async def _receive_loop(self):
+        """接收 PersonaPlex 生成的音频并转发到 pipeline"""
+        try:
+            async for message in self._websocket:
+                if self._is_interrupted:
+                    continue
+                    
+                if isinstance(message, bytes):
+                    # PersonaPlex 输出 PCM 音频，转发到下游
+                    audio_frame = OutputAudioRawFrame(
+                        audio=message,
+                        sample_rate=self._sample_rate,
+                        num_channels=1
+                    )
+                    await self.push_frame(audio_frame)
+                    
+                elif isinstance(message, str):
+                    data = json.loads(message)
+                    if data.get("type") == "status":
+                        print(f"[PersonaPlex] Status: {data}")
+                        
+        except websockets.exceptions.ConnectionClosed:
+            print("[PersonaPlex] WebSocket disconnected")
+        except Exception as e:
+            print(f"[PersonaPlex] Receive error: {e}")
+    
+    async def _process_audio(self, audio_bytes: bytes):
+        """将用户音频发送给 PersonaPlex"""
+        if self._websocket and not self._is_interrupted:
+            await self._websocket.send(audio_bytes)
+    
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        """处理进入的帧"""
+        await super().process_frame(frame, direction)
+        
+        # 处理中断（用户打断 AI 说话）
+        if isinstance(frame, StartInterruptionFrame):
+            self._is_interrupted = True
+            if self._websocket:
+                # 发送中断信号给 PersonaPlex
+                await self._websocket.send(json.dumps({"type": "interrupt"}))
+                
+        elif isinstance(frame, StopInterruptionFrame):
+            self._is_interrupted = False
+            
+        # 处理用户音频输入
+        elif hasattr(frame, 'audio') and frame.audio:
+            await self._process_audio(frame.audio)
+    
+    async def start(self):
+        await self._connect_websocket()
+        
+    async def stop(self):
+        self._is_interrupted = True
+        if self._receive_task:
+            self._receive_task.cancel()
+        if self._websocket:
+            await self._websocket.close()
+
+
+2. 完整的 Pipecat Pipeline 配置
+# main_bot.py
+import asyncio
+from pipecat.pipeline.pipeline import Pipeline
+from pipecat.pipeline.task import PipelineTask
+from pipecat.pipeline.runner import PipelineRunner
+from pipecat.transports.network.websocket_server import (
+    WebsocketServerTransport, 
+    WebsocketServerParams
+)
+from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.processors.frameworks.rtvi import RTVIBotProcessor
+
+# 导入自定义的 PersonaPlex 服务
+from personaplex_llm_service import PersonaPlexLLMService
+
+# 如果需要 STT（可选，PersonaPlex 可以直接处理音频）
+# from pipecat.services.deepgram import DeepgramSTTService
+
+async def main():
+    # 1. 配置 Transport - 接收来自 FreeSWITCH 的 WebSocket 连接
+    transport = WebsocketServerTransport(
+        params=WebsocketServerParams(
+            audio_in_enabled=True,
+            audio_out_enabled=True,
+            vad_enabled=True,
+            vad_analyzer=SileroVADAnalyzer(),
+            vad_audio_passthrough=True,
+            audio_in_sample_rate=16000,   # PersonaPlex 使用 16kHz
+            audio_out_sample_rate=16000,
+        )
+    )
+    
+    # 2. 配置 PersonaPlex 作为核心 LLM 服务
+    #    注意：PersonaPlex 直接输出音频，不需要单独的 TTS
+    llm = PersonaPlexLLMService(
+        websocket_url="ws://localhost:8998/ws",
+        voice_prompt="NATF2",           # 自然女声
+        system_prompt="""You are a helpful customer service agent for a waste management company.
+                         Your name is Alex. Keep responses very short and conversational.
+                         You can check schedules and answer questions about services.""",
+        sample_rate=16000
+    )
+    
+    # 3. 可选：添加 RTVIBotProcessor 用于更复杂的对话管理
+    # rtvi = RTVIBotProcessor(transport=transport)
+    
+    # 4. 构建 Pipeline
+    #    注意：因为 PersonaPlex 是端到端的语音模型，不需要 STT 和 TTS
+    pipeline = Pipeline([
+        transport.input(),      # 接收用户音频
+        # rtvi,                 # 可选：对话管理
+        llm,                    # PersonaPlex 处理（音频→音频）
+        transport.output(),     # 发送 AI 音频回 FreeSWITCH
+    ])
+    
+    task = PipelineTask(pipeline)
+    runner = PipelineRunner()
+    
+    print("""
+╔══════════════════════════════════════════════════════════════════╗
+║     Pipecat + PersonaPlex Voice AI Bot                          ║
+║                                                                  ║
+║  WebSocket server: ws://0.0.0.0:7860/ws                         ║
+║  PersonaPlex endpoint: ws://localhost:8998/ws                   ║
+║                                                                  ║
+║  Architecture: FreeSWITCH → Pipecat → PersonaPlex → Pipecat      ║
+║                                                                  ║
+║  Waiting for FreeSWITCH connections...                          ║
+╚══════════════════════════════════════════════════════════════════╝
+    """)
+    
+    await runner.run(task)
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+
+3. FreeSWITCH Dialplan 配置
+<!-- /etc/freeswitch/dialplan/default/02_pipecat_personaplex.xml -->
+<?xml version="1.0" encoding="utf-8"?>
+<include>
+  <extension name="pipecat_personaplex">
+    <condition field="destination_number" expression="^(8889)$">
+      <!-- 应答呼叫 -->
+      <action application="answer"/>
+      
+      <!-- 设置音频参数：16kHz 单声道 -->
+      <action application="set" data="sip_secure_media=false"/>
+      <action application="set" data="RTP_SAMPLE_RATE=16000"/>
+      <action application="set" data="RTP_TOS=0x68"/>
+      
+      <!-- 桥接到 Pipecat WebSocket 服务 -->
+      <action application="bridge" data="ws://localhost:7860/ws"/>
+      
+      <!-- 如果桥接失败 -->
+      <action application="playback" data="ivr/ivr-service_not_working.wav"/>
+    </condition>
+  </extension>
+</include>
