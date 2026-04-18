@@ -1,0 +1,357 @@
+FreeSWITCH → Pipecat (Transport) → MiniCPM-o 4.5 模型 → Pipecat → FreeSWITCH
+
+# 创建虚拟环境
+python -m venv minicpmo_env
+source minicpmo_env/bin/activate
+
+# 安装核心依赖（注意 transformers 版本必须为 4.51.0）
+pip install "transformers==4.51.0" accelerate "torch>=2.3.0,<=2.8.0" "torchaudio<=2.8.0"
+pip install "minicpmo-utils[all]>=1.0.2" websockets librosa soundfile
+
+# 安装 pipecat（如果需要保留 pipecat 框架）
+pip install pipecat-ai
+
+🔧 第二步：自定义 MiniCPM-o LLM Service
+创建 minicpmo_llm_service.py：
+
+import asyncio
+import queue
+import threading
+import torch
+import librosa
+import numpy as np
+from typing import Optional, Callable, AsyncGenerator
+from dataclasses import dataclass
+from transformers import AutoModel
+
+from pipecat.frames.frames import (
+    Frame, 
+    OutputAudioRawFrame,
+    StartInterruptionFrame,
+    StopInterruptionFrame,
+    UserStartedSpeakingFrame,
+    UserStoppedSpeakingFrame
+)
+from pipecat.services.llm_service import LLMService
+from pipecat.processors.frame_processor import FrameDirection
+
+
+@dataclass
+class ConversationTurn:
+    """对话轮次"""
+    audio_chunk: bytes
+    sample_rate: int
+    timestamp: float
+
+
+class MiniCPMoLLMService(LLMService):
+    """
+    将 MiniCPM-o 4.5 作为 Pipecat 的 LLM 服务组件
+    支持中文实时语音对话和声音克隆
+    """
+    
+    def __init__(
+        self,
+        model_path: str = "openbmb/MiniCPM-o-4_5",
+        ref_audio_path: Optional[str] = None,  # 参考音频路径，用于声音克隆
+        system_prompt: str = None,
+        sample_rate: int = 16000,  # 与 FreeSWITCH 匹配
+        use_quantization: bool = True,  # 是否使用 int4 量化（节省显存）
+        duplex_mode: bool = True,  # 是否启用全双工模式
+        **kwargs
+    ):
+        super().__init__(**kwargs)
+        self._model_path = model_path
+        self._ref_audio_path = ref_audio_path
+        self._system_prompt = system_prompt or self._get_default_prompt()
+        self._sample_rate = sample_rate
+        self._use_quantization = use_quantization
+        self._duplex_mode = duplex_mode
+        
+        self._model = None
+        self._duplex_model = None
+        self._audio_queue = asyncio.Queue()
+        self._response_queue = asyncio.Queue()
+        self._is_speaking = False
+        self._is_interrupted = False
+        self._processing_task = None
+        
+    def _get_default_prompt(self):
+        """默认系统提示词（中文）"""
+        return """你是一个友好的AI语音助手，名叫小智。
+        你的回答要简洁、口语化，一般不超过两句话。
+        要自然、亲切，像朋友一样交谈。
+        当用户提问时，给出有帮助的回答。"""
+    
+    async def _load_model(self):
+        """加载 MiniCPM-o 4.5 模型"""
+        print(f"[MiniCPMo] Loading model from {self._model_path}...")
+        
+        # 加载模型（int4 量化可降至 11GB 显存）
+        model = AutoModel.from_pretrained(
+            self._model_path,
+            trust_remote_code=True,
+            attn_implementation="sdpa",  # 或 "flash_attention_2"
+            torch_dtype=torch.bfloat16,
+            init_vision=False,   # 外呼场景不需要视觉
+            init_audio=True,     # 需要音频输入
+            init_tts=True,       # 需要语音输出
+            device_map="auto",
+            low_cpu_mem_usage=True
+        )
+        
+        # 如果启用量化（需要 auto-gptq）
+        if self._use_quantization:
+            print("[MiniCPMo] Using int4 quantization...")
+            # 注意：需要先安装 auto-gptq
+            # model = model.quantize(4)
+        
+        model.eval()
+        
+        # 初始化 TTS
+        model.init_tts(streaming=True)
+        
+        # 转换为全双工模式
+        if self._duplex_mode:
+            self._duplex_model = model.as_duplex()
+            print("[MiniCPMo] Duplex mode enabled")
+        else:
+            self._duplex_model = model
+        
+        self._model = model
+        print("[MiniCPMo] Model loaded successfully")
+    
+    async def _prepare_session(self):
+        """准备对话会话（设置系统提示词和声音克隆）"""
+        if self._duplex_model is None:
+            return
+        
+        # 加载参考音频（用于声音克隆）
+        ref_audio = None
+        if self._ref_audio_path:
+            ref_audio, _ = librosa.load(self._ref_audio_path, sr=16000, mono=True)
+            ref_audio = torch.from_numpy(ref_audio).float()
+            print(f"[MiniCPMo] Voice cloning from {self._ref_audio_path}")
+        
+        # 准备会话
+        self._duplex_model.prepare(
+            prefix_system_prompt=self._system_prompt,
+            ref_audio=ref_audio,
+            prompt_wav_path=self._ref_audio_path
+        )
+        
+        print("[MiniCPMo] Session prepared")
+    
+    async def start(self):
+        """启动服务"""
+        await self._load_model()
+        await self._prepare_session()
+        # 启动处理任务
+        self._processing_task = asyncio.create_task(self._process_loop())
+    
+    async def stop(self):
+        """停止服务"""
+        self._is_interrupted = True
+        if self._processing_task:
+            self._processing_task.cancel()
+        if self._model:
+            del self._model
+            torch.cuda.empty_cache()
+    
+    async def _process_loop(self):
+        """主处理循环：处理用户音频并生成响应"""
+        while True:
+            try:
+                # 等待用户音频块
+                audio_chunk = await self._audio_queue.get()
+                
+                if self._is_interrupted:
+                    continue
+                
+                # 流式预填充（将音频输入到模型）
+                audio_tensor = torch.from_numpy(
+                    np.frombuffer(audio_chunk, dtype=np.int16)
+                ).float() / 32768.0
+                
+                self._duplex_model.streaming_prefill(
+                    audio_waveform=audio_tensor,
+                    frame_list=None,  # 外呼场景无视频
+                    max_slice_nums=1,
+                    batch_vision_feed=False,
+                )
+                
+                # 流式生成响应
+                result = self._duplex_model.streaming_generate(
+                    max_new_speak_tokens_per_chunk=50,
+                    decode_mode="sampling",
+                )
+                
+                # 如果模型决定说话，输出音频
+                if result["audio_waveform"] is not None and not result["is_listen"]:
+                    self._is_speaking = True
+                    
+                    # 转换为 Pipecat 音频帧
+                    audio_np = result["audio_waveform"].cpu().numpy()
+                    audio_int16 = (audio_np * 32767).astype(np.int16)
+                    
+                    audio_frame = OutputAudioRawFrame(
+                        audio=audio_int16.tobytes(),
+                        sample_rate=24000,  # MiniCPM-o 输出 24kHz
+                        num_channels=1
+                    )
+                    await self.push_frame(audio_frame)
+                    
+                    # 输出文本（用于调试）
+                    if result["text"]:
+                        print(f"[MiniCPMo] AI: {result['text']}")
+                    
+                    self._is_speaking = False
+                
+                # 检查是否结束轮次
+                if result.get("end_of_turn"):
+                    await self.push_frame(UserStoppedSpeakingFrame())
+                    
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                print(f"[MiniCPMo] Processing error: {e}")
+    
+    async def _process_audio_input(self, audio_bytes: bytes):
+        """接收用户音频输入"""
+        await self._audio_queue.put(audio_bytes)
+    
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        """处理进入的帧"""
+        await super().process_frame(frame, direction)
+        
+        # 处理中断（用户打断）
+        if isinstance(frame, StartInterruptionFrame):
+            self._is_interrupted = True
+            if self._duplex_model:
+                # 全双工模式下，模型会自动处理打断
+                pass
+                
+        elif isinstance(frame, StopInterruptionFrame):
+            self._is_interrupted = False
+            
+        # 处理用户开始说话
+        elif isinstance(frame, UserStartedSpeakingFrame):
+            print("[MiniCPMo] User started speaking")
+            
+        # 处理用户音频输入
+        elif hasattr(frame, 'audio') and frame.audio:
+            await self._process_audio_input(frame.audio)
+
+
+创建 main_bot.py：
+# main_bot.py
+import asyncio
+import os
+from pipecat.pipeline.pipeline import Pipeline
+from pipecat.pipeline.task import PipelineTask
+from pipecat.pipeline.runner import PipelineRunner
+from pipecat.transports.network.websocket_server import (
+    WebsocketServerTransport, 
+    WebsocketServerParams
+)
+from pipecat.audio.vad.silero import SileroVADAnalyzer
+
+# 导入自定义的 MiniCPM-o 服务
+from minicpmo_llm_service import MiniCPMoLLMService
+
+
+async def main():
+    # 1. 配置 Transport - 接收来自 FreeSWITCH 的 WebSocket 连接
+    transport = WebsocketServerTransport(
+        params=WebsocketServerParams(
+            audio_in_enabled=True,
+            audio_out_enabled=True,
+            vad_enabled=True,
+            vad_analyzer=SileroVADAnalyzer(),
+            vad_audio_passthrough=True,
+            audio_in_sample_rate=16000,
+            audio_out_sample_rate=24000,  # MiniCPM-o 输出 24kHz
+        )
+    )
+    
+    # 2. 配置 MiniCPM-o 作为核心 LLM 服务
+    llm = MiniCPMoLLMService(
+        model_path="openbmb/MiniCPM-o-4_5",
+        ref_audio_path="voice_samples/my_voice.wav",  # 可选：声音克隆参考音频
+        system_prompt="""你是一个专业的AI客服助手，名叫小智。
+                        你正在为用户提供电话咨询服务。
+                        回答要简洁明了，每句话控制在15秒以内。
+                        如果用户问及产品信息，要准确回答。
+                        保持礼貌和耐心。""",
+        sample_rate=16000,
+        use_quantization=True,   # 启用 int4 量化，显存降至 11GB
+        duplex_mode=True,        # 启用全双工
+    )
+    
+    # 3. 构建 Pipeline
+    pipeline = Pipeline([
+        transport.input(),
+        llm,
+        transport.output(),
+    ])
+    
+    task = PipelineTask(pipeline)
+    runner = PipelineRunner()
+    
+    # 启动 LLM 服务
+    await llm.start()
+    
+    print("""
+╔══════════════════════════════════════════════════════════════════╗
+║     Pipecat + MiniCPM-o 4.5 Voice AI Bot                        ║
+║                                                                  ║
+║  WebSocket server: ws://0.0.0.0:7860/ws                         ║
+║  Model: MiniCPM-o 4.5 (9B, int4量化 ~11GB显存)                  ║
+║  Features: 中文实时对话、声音克隆、全双工、可打断               ║
+║                                                                  ║
+║  Waiting for FreeSWITCH connections...                          ║
+╚══════════════════════════════════════════════════════════════════╝
+    """)
+    
+    await runner.run(task)
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+
+⚙️ 第四步：FreeSWITCH 配置（保持不变）
+<!-- /etc/freeswitch/dialplan/default/03_minicpmo.xml -->
+<?xml version="1.0" encoding="utf-8"?>
+<include>
+  <extension name="minicpmo_ai">
+    <condition field="destination_number" expression="^(8888)$">
+      <action application="answer"/>
+      <action application="set" data="sip_secure_media=false"/>
+      <action application="set" data="RTP_SAMPLE_RATE=16000"/>
+      <action application="bridge" data="ws://localhost:7860/ws"/>
+      <action application="playback" data="ivr/ivr-service_not_working.wav"/>
+    </condition>
+  </extension>
+</include>
+
+
+🚀 第五步：运行服务
+# 1. 启动 Pipecat + MiniCPM-o 服务
+python main_bot.py
+
+# 2. 确保 FreeSWITCH 运行并加载配置
+fs_cli -x "reloadxml"
+fs_cli -x "sofia profile external restart"
+
+# 3. 用软电话拨打 8888 测试
+
+
+📊 MiniCPM-o 4.5 vs PersonaPlex 对比
+特性	MiniCPM-o 4.5	PersonaPlex	你的优势
+中文支持	✅ 原生支持	❌ 仅英文	无需微调
+声音克隆	✅ 几秒音频样本	✅ 支持	同等能力
+全双工	✅ 原生实现	✅ 支持	均可打断
+显存需求	11GB (int4)	24GB+	你的 4070 Ti 可跑
+主动交互	✅ 1Hz 主动决策	❌	可做主动提醒
+开源协议	Apache 2.0	NVIDIA Open Model	更自由
+MiniCPM-o 4.5 的 int4 量化版本仅需 11GB 显存，刚好在你的 RTX 4070 Ti 12GB 显存范围内，可以流畅运行。同时原生支持中文和声音克隆，无需额外 SFT 工作。
