@@ -1,1 +1,81 @@
 
+呼出功能
+在 gateway.py 里都有这个 HTTP API：
+
+@api_app.post("/call")
+async def make_call(request: dict):
+    phone = request.get("phone_number")
+    # ...
+    originate_str = (
+        f"originate "
+        f"{{origination_uuid={call_uuid},"
+        f"origination_caller_id_number={caller_id},"
+        f"origination_caller_id_name=AI,"
+        f"ignore_early_media=true}} "
+        f"sofia/gateway/{gateway}/{phone} "  # ← 通过 FXO 网关拨打 PSTN 号码
+        f"&park"  # ← 接通后 park，等待 ESL 接管
+    )
+    result = esl_conn.send_command(originate_str)
+
+调用方式：
+
+curl -X POST http://127.0.0.1:8080/call \
+  -H "Content-Type: application/json" \
+  -d '{"phone_number":"13800138000"}'
+
+这会让 FreeSWITCH 通过迅时 FXO 网关拨打 13800138000，接通后进入 park 状态，然后 Python 网关通过 ESL 事件检测到 CHANNEL_ANSWER，启动 AI 会话。
+
+
+
+呼入功能
+同时也有：
+
+def on_channel_create(event):
+    # 处理来电...
+    
+def on_channel_answer(event):
+    # 来电接通后启动 AI...
+
+FreeSWITCH Dialplan 配置：
+
+<extension name="ai_inbound">
+    <condition field="destination_number" expression="^(\d+)$">
+        <action application="answer"/>
+        <action application="sleep" data="100"/>
+        <action application="park"/>  <!-- ← 来电 park，等待 Python 接管 -->
+    </condition>
+</extension>
+
+
+
+| 方向     | 触发方式             | 流程                                               |
+| ------ | ---------------- | ------------------------------------------------ |
+| **呼出** | HTTP API `/call` | Python → FreeSWITCH → FXO 网关 → PSTN → 用户手机       |
+| **呼入** | PSTN 来电          | 用户手机 → FXO 网关 → FreeSWITCH → park → Python AI 接管 |
+
+
+
+# 1. 先用 v1.0 FIFO 验证
+unzip minicpm_gateway_v1_fifo.zip
+pip install -r requirements.txt
+# 配置 config.py 里的 CLOUD_API_KEY
+python gateway.py
+
+# 2. 测试呼出
+curl -X POST http://127.0.0.1:8080/call \
+  -H "Content-Type: application/json" \
+  -d '{"phone_number":"你的手机号"}'
+
+# 3. 测试呼入（用手机打 FXO 网关接入的 PSTN 号码）
+
+# 4. 稳定后切 v2.0
+# 编译 mod_audio_fork → 换 v2.0 代码 → 延迟降低 3-5 倍
+
+
+
+
+| 阶段     | 动作                             | 改动量                                    |
+| ------ | ------------------------------ | -------------------------------------- |
+| **现在** | 云端 API + v1.0 FIFO             | 只配 `CLOUD_API_KEY`                     |
+| **优化** | 云端 API + v2.0 mod\_audio\_fork | 编译模块，换代码                               |
+| **未来** | 本地 4070+ + v2.0                | 改 `AI_MODE = "local"` + `LOCAL_WS_URL` |
