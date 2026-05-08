@@ -1,0 +1,26 @@
+"""配置集中管理"""
+
+# FreeSWITCH ESL
+FS_HOST = "127.0.0.1"
+FS_ESL_PORT = 8021
+FS_ESL_PASS = "ClueCon"
+
+# 音频参数
+FS_SAMPLE_RATE = 8000
+MINICPM_SAMPLE_RATE = 16000  # 根据你的 MiniCPM-o 模型调整，可能是 24000
+FRAME_DURATION_MS = 20
+
+# 网络
+AUDIO_PORT_BASE = 35000
+AUDIO_PORT_MAX = 45000
+
+# MiniCPM-o
+MINICPM_WS_URL = "ws://127.0.0.1:8080/audio_stream"
+MINICPM_TIMEOUT = 30
+
+# 外呼
+OUTBOUND_CID = "02112345678"
+FXO_GATEWAY = "newrock_fxo"
+
+# 日志
+LOG_LEVEL = "INFO"
