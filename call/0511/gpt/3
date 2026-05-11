@@ -1,0 +1,1057 @@
+```text
+minicpm_gateway/
+├── app/
+│   ├── __init__.py
+│   ├── main.py
+│   ├── config.py
+│   ├── metrics.py
+│   ├── audio.py
+│   ├── ai_client.py
+│   ├── session.py
+│   ├── manager.py
+│   ├── logging_utils.py
+│   └── ws_server.py
+├── requirements.txt
+├── Dockerfile
+├── docker-compose.yml
+├── .env.example
+├── gateway.service
+├── README.md
+└── freeswitch/
+    └── dialplan.xml
+```
+
+==================================================
+requirements.txt
+==================================================
+
+```txt
+fastapi
+uvicorn[standard]
+websockets
+numpy
+scipy
+python-dotenv
+prometheus-client
+uvloop
+orjson
+```
+
+==================================================
+.env.example
+==================================================
+
+```env
+FS_STREAM_URL=wss://YOUR_HOST/media
+
+AI_WS_URL=wss://api.openai.com/v1/realtime?model=gpt-realtime
+AI_API_KEY=sk-xxxx
+
+LOG_LEVEL=INFO
+
+MAX_SESSIONS=50
+
+AI_RESPONSE_TIMEOUT=20
+SESSION_IDLE_TIMEOUT=300
+
+FRAME_MS=40
+
+PLAYBACK_SAMPLE_RATE=8000
+AI_SAMPLE_RATE=16000
+```
+
+==================================================
+app/config.py
+==================================================
+
+```python
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+AI_WS_URL = os.getenv("AI_WS_URL")
+AI_API_KEY = os.getenv("AI_API_KEY")
+
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+
+MAX_SESSIONS = int(
+    os.getenv("MAX_SESSIONS", 50)
+)
+
+FRAME_MS = int(
+    os.getenv("FRAME_MS", 40)
+)
+
+AI_RESPONSE_TIMEOUT = int(
+    os.getenv("AI_RESPONSE_TIMEOUT", 20)
+)
+
+SESSION_IDLE_TIMEOUT = int(
+    os.getenv("SESSION_IDLE_TIMEOUT", 300)
+)
+
+PLAYBACK_SAMPLE_RATE = int(
+    os.getenv("PLAYBACK_SAMPLE_RATE", 8000)
+)
+
+AI_SAMPLE_RATE = int(
+    os.getenv("AI_SAMPLE_RATE", 16000)
+)
+```
+
+==================================================
+app/logging_utils.py
+==================================================
+
+```python
+import logging
+import orjson
+import time
+
+
+class JsonFormatter(logging.Formatter):
+
+    def format(self, record):
+
+        payload = {
+            "ts": time.time(),
+            "level": record.levelname,
+            "msg": record.getMessage(),
+            "module": record.module,
+        }
+
+        if hasattr(record, "call_id"):
+            payload["call_id"] = record.call_id
+
+        return orjson.dumps(payload).decode()
+
+
+def setup_logging(level):
+
+    handler = logging.StreamHandler()
+
+    handler.setFormatter(
+        JsonFormatter()
+    )
+
+    root = logging.getLogger()
+
+    root.setLevel(level)
+
+    root.handlers.clear()
+
+    root.addHandler(handler)
+```
+
+==================================================
+app/metrics.py
+==================================================
+
+```python
+from prometheus_client import Counter
+from prometheus_client import Gauge
+from prometheus_client import Histogram
+
+ACTIVE_CALLS = Gauge(
+    "active_calls",
+    "Current active calls"
+)
+
+AI_RECONNECTS = Counter(
+    "ai_reconnects_total",
+    "AI reconnect count"
+)
+
+BARGE_IN_TOTAL = Counter(
+    "barge_in_total",
+    "Barge in count"
+)
+
+AUDIO_RX_BYTES = Counter(
+    "audio_rx_bytes_total",
+    "Audio received bytes"
+)
+
+AUDIO_TX_BYTES = Counter(
+    "audio_tx_bytes_total",
+    "Audio transmitted bytes"
+)
+
+AI_LATENCY = Histogram(
+    "ai_response_latency_seconds",
+    "AI response latency"
+)
+```
+
+==================================================
+app/audio.py
+==================================================
+
+```python
+import numpy as np
+
+
+def bytes_to_pcm16(data):
+
+    return np.frombuffer(
+        data,
+        dtype=np.int16
+    )
+
+
+def pcm16_to_bytes(arr):
+
+    return arr.astype(
+        np.int16
+    ).tobytes()
+
+
+def resample(audio, src_rate, dst_rate):
+
+    if src_rate == dst_rate:
+        return audio
+
+    ratio = dst_rate / src_rate
+
+    old_len = len(audio)
+
+    new_len = int(old_len * ratio)
+
+    old_idx = np.arange(old_len)
+
+    new_idx = np.linspace(
+        0,
+        old_len - 1,
+        new_len
+    )
+
+    return np.interp(
+        new_idx,
+        old_idx,
+        audio
+    ).astype(np.int16)
+```
+
+==================================================
+app/manager.py
+==================================================
+
+```python
+import threading
+
+from app.metrics import ACTIVE_CALLS
+
+
+class SessionManager:
+
+    def __init__(self):
+
+        self.sessions = {}
+
+        self.lock = threading.Lock()
+
+    def add(self, session):
+
+        with self.lock:
+
+            self.sessions[
+                session.call_id
+            ] = session
+
+            ACTIVE_CALLS.inc()
+
+    def get(self, call_id):
+
+        return self.sessions.get(call_id)
+
+    def remove(self, call_id):
+
+        with self.lock:
+
+            if call_id in self.sessions:
+
+                del self.sessions[
+                    call_id
+                ]
+
+                ACTIVE_CALLS.dec()
+
+    def count(self):
+
+        return len(self.sessions)
+
+
+manager = SessionManager()
+```
+
+==================================================
+app/ai_client.py
+==================================================
+
+```python
+import asyncio
+import base64
+import json
+import logging
+import time
+
+import websockets
+
+from app.config import *
+from app.metrics import *
+
+logger = logging.getLogger(__name__)
+
+
+class AIClient:
+
+    def __init__(self, session):
+
+        self.session = session
+
+        self.ws = None
+
+        self.connected = False
+
+        self.pending_ms = 0
+
+        self.last_response_time = time.time()
+
+    # --------------------------------------------
+
+    async def connect(self):
+
+        backoff = 1
+
+        while True:
+
+            try:
+
+                headers = {
+                    "Authorization":
+                        f"Bearer {AI_API_KEY}",
+                    "OpenAI-Beta":
+                        "realtime=v1"
+                }
+
+                self.ws = await websockets.connect(
+                    AI_WS_URL,
+                    additional_headers=headers,
+                    compression=None,
+                    ping_interval=20,
+                    ping_timeout=10,
+                )
+
+                self.connected = True
+
+                asyncio.create_task(
+                    self.recv_loop()
+                )
+
+                await self.initialize()
+
+                logger.info(
+                    "AI connected"
+                )
+
+                return
+
+            except Exception:
+
+                logger.exception(
+                    "AI connect failed"
+                )
+
+                AI_RECONNECTS.inc()
+
+                await asyncio.sleep(
+                    backoff
+                )
+
+                backoff = min(
+                    backoff * 2,
+                    30
+                )
+
+    # --------------------------------------------
+
+    async def initialize(self):
+
+        while True:
+
+            msg = await self.ws.recv()
+
+            data = json.loads(msg)
+
+            if data.get(
+                "type"
+            ) == "session.created":
+                break
+
+        await self.ws.send(json.dumps({
+            "type": "session.update",
+            "session": {
+                "voice": "alloy",
+                "instructions":
+                    "你是专业中文电话客服助手，"
+                    "回答简洁自然。",
+                "turn_detection": {
+                    "type": "server_vad"
+                },
+                "input_audio_format":
+                    "pcm16",
+                "output_audio_format":
+                    "pcm16",
+            }
+        }))
+
+    # --------------------------------------------
+
+    async def send_audio(self, pcm16):
+
+        if not self.connected:
+            return
+
+        b64 = base64.b64encode(
+            pcm16
+        ).decode()
+
+        await self.ws.send(json.dumps({
+            "type":
+                "input_audio_buffer.append",
+            "audio":
+                b64
+        }))
+
+        self.pending_ms += FRAME_MS
+
+        if self.pending_ms >= 400:
+
+            await self.ws.send(json.dumps({
+                "type":
+                    "input_audio_buffer.commit"
+            }))
+
+            self.pending_ms = 0
+
+    # --------------------------------------------
+
+    async def send_text(self, text):
+
+        await self.ws.send(json.dumps({
+            "type":
+                "conversation.item.create",
+            "item": {
+                "type":
+                    "message",
+                "role":
+                    "user",
+                "content": [
+                    {
+                        "type":
+                            "input_text",
+                        "text":
+                            text
+                    }
+                ]
+            }
+        }))
+
+        await self.ws.send(json.dumps({
+            "type":
+                "response.create"
+        }))
+
+    # --------------------------------------------
+
+    async def interrupt(self):
+
+        if not self.connected:
+            return
+
+        await self.ws.send(json.dumps({
+            "type":
+                "response.cancel"
+        }))
+
+        await self.ws.send(json.dumps({
+            "type":
+                "input_audio_buffer.clear"
+        }))
+
+    # --------------------------------------------
+
+    async def recv_loop(self):
+
+        try:
+
+            async for msg in self.ws:
+
+                data = json.loads(msg)
+
+                t = data.get("type", "")
+
+                if t == (
+                    "response.output_audio.delta"
+                ):
+
+                    self.last_response_time = (
+                        time.time()
+                    )
+
+                    audio = base64.b64decode(
+                        data["delta"]
+                    )
+
+                    self.session.on_ai_audio(
+                        audio
+                    )
+
+                elif t == (
+                    "response.output_audio.done"
+                ):
+
+                    self.session.on_ai_done()
+
+                elif t == (
+                    "input_audio_buffer."
+                    "speech_started"
+                ):
+
+                    self.session.on_user_speech()
+
+        except Exception:
+
+            logger.exception(
+                "AI recv loop"
+            )
+
+            self.connected = False
+
+    # --------------------------------------------
+
+    async def close(self):
+
+        self.connected = False
+
+        if self.ws:
+            await self.ws.close()
+```
+
+==================================================
+app/session.py
+==================================================
+
+```python
+import asyncio
+import logging
+import time
+
+from app.audio import *
+from app.ai_client import AIClient
+from app.config import *
+from app.metrics import *
+
+logger = logging.getLogger(__name__)
+
+
+class CallSession:
+
+    def __init__(
+        self,
+        call_id,
+        websocket,
+        loop
+    ):
+
+        self.call_id = call_id
+
+        self.ws = websocket
+
+        self.loop = loop
+
+        self.ai = None
+
+        self.active = True
+
+        self.is_ai_speaking = False
+
+        self.last_activity = time.time()
+
+        self.interrupt_lock = asyncio.Lock()
+
+        self.tx_queue = asyncio.Queue(
+            maxsize=100
+        )
+
+    # --------------------------------------------
+
+    async def start(self):
+
+        self.ai = AIClient(self)
+
+        await self.ai.connect()
+
+        asyncio.create_task(
+            self.tx_worker()
+        )
+
+        asyncio.create_task(
+            self.watchdog()
+        )
+
+        logger.info(
+            f"[{self.call_id}] started"
+        )
+
+    # --------------------------------------------
+
+    async def watchdog(self):
+
+        while self.active:
+
+            await asyncio.sleep(5)
+
+            now = time.time()
+
+            if (
+                now - self.last_activity
+                > SESSION_IDLE_TIMEOUT
+            ):
+
+                logger.warning(
+                    "[%s] idle timeout",
+                    self.call_id
+                )
+
+                await self.close()
+
+                return
+
+            if (
+                now - self.ai.last_response_time
+                > AI_RESPONSE_TIMEOUT
+                and self.is_ai_speaking
+            ):
+
+                logger.warning(
+                    "[%s] ai timeout",
+                    self.call_id
+                )
+
+                self.is_ai_speaking = False
+
+    # --------------------------------------------
+
+    async def on_rtp_audio(
+        self,
+        audio_bytes
+    ):
+
+        self.last_activity = time.time()
+
+        AUDIO_RX_BYTES.inc(
+            len(audio_bytes)
+        )
+
+        pcm8k = bytes_to_pcm16(
+            audio_bytes
+        )
+
+        pcm16k = resample(
+            pcm8k,
+            PLAYBACK_SAMPLE_RATE,
+            AI_SAMPLE_RATE
+        )
+
+        await self.ai.send_audio(
+            pcm16_to_bytes(
+                pcm16k
+            )
+        )
+
+    # --------------------------------------------
+
+    def on_ai_audio(
+        self,
+        audio_16k
+    ):
+
+        if not self.active:
+            return
+
+        self.is_ai_speaking = True
+
+        pcm16k = bytes_to_pcm16(
+            audio_16k
+        )
+
+        pcm8k = resample(
+            pcm16k,
+            AI_SAMPLE_RATE,
+            PLAYBACK_SAMPLE_RATE
+        )
+
+        out = pcm16_to_bytes(
+            pcm8k
+        )
+
+        AUDIO_TX_BYTES.inc(
+            len(out)
+        )
+
+        try:
+
+            self.tx_queue.put_nowait(out)
+
+        except asyncio.QueueFull:
+
+            logger.warning(
+                "[%s] tx overflow",
+                self.call_id
+            )
+
+            try:
+                self.tx_queue.get_nowait()
+            except:
+                pass
+
+    # --------------------------------------------
+
+    async def tx_worker(self):
+
+        while self.active:
+
+            try:
+
+                audio = await self.tx_queue.get()
+
+                await self.ws.send_bytes(
+                    audio
+                )
+
+            except Exception:
+
+                logger.exception(
+                    "tx worker"
+                )
+
+                break
+
+    # --------------------------------------------
+
+    def on_ai_done(self):
+
+        self.is_ai_speaking = False
+
+    # --------------------------------------------
+
+    def on_user_speech(self):
+
+        if self.is_ai_speaking:
+
+            asyncio.run_coroutine_threadsafe(
+                self.barge_in(),
+                self.loop
+            )
+
+    # --------------------------------------------
+
+    async def barge_in(self):
+
+        async with self.interrupt_lock:
+
+            BARGE_IN_TOTAL.inc()
+
+            logger.info(
+                "[%s] barge-in",
+                self.call_id
+            )
+
+            await self.ai.interrupt()
+
+            self.is_ai_speaking = False
+
+            while not self.tx_queue.empty():
+
+                try:
+                    self.tx_queue.get_nowait()
+                except:
+                    break
+
+    # --------------------------------------------
+
+    async def close(self):
+
+        if not self.active:
+            return
+
+        self.active = False
+
+        try:
+
+            await self.ai.close()
+
+        except:
+            pass
+
+        logger.info(
+            "[%s] closed",
+            self.call_id
+        )
+```
+
+==================================================
+app/ws_server.py
+==================================================
+
+```python
+import asyncio
+import logging
+import uuid
+
+from fastapi import APIRouter
+from fastapi import WebSocket
+from fastapi import WebSocketDisconnect
+
+from app.manager import manager
+from app.session import CallSession
+from app.config import *
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter()
+
+
+@router.websocket("/media")
+async def media_socket(
+    websocket: WebSocket
+):
+
+    if manager.count() >= MAX_SESSIONS:
+
+        await websocket.close()
+
+        return
+
+    await websocket.accept()
+
+    call_id = str(uuid.uuid4())
+
+    session = CallSession(
+        call_id,
+        websocket,
+        asyncio.get_running_loop()
+    )
+
+    manager.add(session)
+
+    await session.start()
+
+    try:
+
+        while True:
+
+            audio = await websocket.receive_bytes()
+
+            await session.on_rtp_audio(
+                audio
+            )
+
+    except WebSocketDisconnect:
+
+        pass
+
+    except Exception:
+
+        logger.exception(
+            "media socket"
+        )
+
+    finally:
+
+        await session.close()
+
+        manager.remove(call_id)
+```
+
+==================================================
+app/main.py
+==================================================
+
+```python
+import asyncio
+import uvloop
+
+from fastapi import FastAPI
+from prometheus_client import make_asgi_app
+
+from app.config import *
+from app.logging_utils import *
+from app.ws_server import router
+
+asyncio.set_event_loop_policy(
+    uvloop.EventLoopPolicy()
+)
+
+setup_logging(LOG_LEVEL)
+
+app = FastAPI()
+
+app.include_router(router)
+
+metrics_app = make_asgi_app()
+
+app.mount(
+    "/metrics",
+    metrics_app
+)
+
+
+@app.get("/")
+async def root():
+
+    return {
+        "status": "running"
+    }
+```
+
+==================================================
+Dockerfile
+==================================================
+
+```dockerfile
+FROM python:3.11-slim
+
+WORKDIR /app
+
+COPY requirements.txt .
+
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+CMD ["python", "-m", "app.main"]
+```
+
+==================================================
+docker-compose.yml
+==================================================
+
+```yaml
+version: "3"
+
+services:
+
+  gateway:
+
+    build: .
+
+    restart: always
+
+    ports:
+      - "8080:8080"
+
+    env_file:
+      - .env
+
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+```
+
+==================================================
+gateway.service
+==================================================
+
+```ini
+[Unit]
+Description=MiniCPM Gateway
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/minicpm_gateway
+
+ExecStart=/usr/bin/python3 -m app.main
+
+Restart=always
+RestartSec=3
+
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
+```
+
+==================================================
+freeswitch/dialplan.xml
+==================================================
+
+```xml
+<extension name="ai_gateway">
+
+  <condition field="destination_number"
+             expression="^9999$">
+
+    <action application="answer"/>
+
+    <action application="audio_stream"
+      data="ws://YOUR_GATEWAY_IP:8080/media mono 8k"/>
+
+    <action application="park"/>
+
+  </condition>
+
+</extension>
+```
+
+==================================================
+README.md
+==================================================
+
+````md
+# MiniCPM Production Gateway
+
+生产级 FreeSWITCH AI 实时语音网关
+
+## Features
+
+- mod_audio_stream
+- 低延迟 RTP
+- OpenAI Realtime
+- barge-in
+- reconnect
+- watchdog
+- metrics
+- uvloop
+- structured logging
+
+## Run
+
+```bash
+cp .env.example .env
+docker compose up --build
+```
+
+## Metrics
+
+```bash
+curl http://localhost:8080/metrics
+```
+
+## FreeSWITCH
+
+安装：
+
+mod_audio_stream
+
+Dialplan:
+
+```xml
+<action application="audio_stream"
+data="ws://IP:8080/media mono 8k"/>
+```
+````
