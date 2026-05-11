@@ -1,0 +1,3007 @@
+全部重新生成，每个文件完整可运行。
+
+---
+
+## `config.py`
+
+```python
+# ── FreeSWITCH ESL ──────────────────────────────────────────────────────
+FS_HOST     = "127.0.0.1"
+FS_ESL_PORT = 8021
+FS_ESL_PASS = "ClueCon"
+
+# ── AI 后端 ─────────────────────────────────────────────────────────────
+AI_MODE          = "local"          # "local" | "cloud"
+MINICPM_WS_URL   = "ws://127.0.0.1:9000/ws"
+CLOUD_API_KEY    = ""
+AI_SAMPLE_RATE   = 16_000
+AI_SYSTEM_PROMPT = "你是一个电话客服助手，说话简洁自然。"
+AI_VOICE         = "alloy"
+
+# ── 音频流模式 ───────────────────────────────────────────────────────────
+# True  = mod_audio_stream（低延迟，需要 FS 安装 mod_audio_stream）
+# False = FIFO 降级模式
+USE_AUDIO_STREAM = True
+STREAM_WS_HOST   = "0.0.0.0"
+STREAM_WS_PORT   = 8081
+
+# ── 外呼 ────────────────────────────────────────────────────────────────
+FXO_GATEWAY  = "pstn"
+OUTBOUND_CID = "10000"
+
+# ── 服务端口 ────────────────────────────────────────────────────────────
+API_PORT     = 8080
+METRICS_PORT = 9090
+
+# ── ESL 重连 ────────────────────────────────────────────────────────────
+ESL_RECONNECT_INTERVAL = 5     # 断线重连间隔（秒）
+ESL_MAX_RECONNECTS     = 0     # 0 = 无限重试
+
+# ── 日志 ────────────────────────────────────────────────────────────────
+LOG_LEVEL = "INFO"
+```
+
+---
+
+## `audio_utils.py`
+
+```python
+"""
+audio_utils.py  ─  G.711a 编解码 + 重采样
+
+依赖优先级：
+  G.711a : audioop（内置）→ audioop-lts（3.13+）→ pyg711
+  重采样  : soxr → scipy → 线性插值（最差）
+
+安装建议：
+  Python <= 3.12 : pip install soxr
+  Python >= 3.13 : pip install soxr audioop-lts
+"""
+
+import logging
+import sys
+
+import numpy as np
+
+logger = logging.getLogger("AudioUtils")
+
+# ── G.711a 编解码 ────────────────────────────────────────────────────────
+
+def _load_alaw_codec():
+    """按优先级加载 G.711a 编解码实现。"""
+
+    # 方案 1：audioop（Python 内置，3.13 前）
+    try:
+        import audioop as _audioop
+
+        def _alaw2lin(data: bytes) -> bytes:
+            return _audioop.alaw2lin(data, 2)
+
+        def _lin2alaw(data: bytes) -> bytes:
+            return _audioop.lin2alaw(data, 2)
+
+        logger.debug("G.711a codec: audioop (built-in)")
+        return _alaw2lin, _lin2alaw
+    except ImportError:
+        pass
+
+    # 方案 2：audioop-lts（Python 3.13+ 替代包）
+    try:
+        import audioop_lts as _audioop
+
+        def _alaw2lin(data: bytes) -> bytes:
+            return _audioop.alaw2lin(data, 2)
+
+        def _lin2alaw(data: bytes) -> bytes:
+            return _audioop.lin2alaw(data, 2)
+
+        logger.debug("G.711a codec: audioop-lts")
+        return _alaw2lin, _lin2alaw
+    except ImportError:
+        pass
+
+    # 方案 3：pyg711
+    try:
+        import g711
+
+        def _alaw2lin(data: bytes) -> bytes:
+            samples = g711.decode_alaw(np.frombuffer(data, dtype=np.uint8))
+            return samples.astype(np.int16).tobytes()
+
+        def _lin2alaw(data: bytes) -> bytes:
+            samples = np.frombuffer(data, dtype=np.int16)
+            return g711.encode_alaw(samples).tobytes()
+
+        logger.debug("G.711a codec: pyg711")
+        return _alaw2lin, _lin2alaw
+    except ImportError:
+        pass
+
+    # 方案 4：纯 Python 查表（最后手段，仅用于测试）
+    logger.warning(
+        "No G.711a library found. Using pure-Python fallback (low quality). "
+        "Install: pip install soxr audioop-lts"
+    )
+    return _alaw2lin_fallback, _lin2alaw_fallback
+
+
+def _alaw2lin_fallback(data: bytes) -> bytes:
+    """G.711a → PCM16 纯 Python 实现（仅测试用）。"""
+    ALAW_TO_LINEAR = _build_alaw_table()
+    out = np.array([ALAW_TO_LINEAR[b] for b in data], dtype=np.int16)
+    return out.tobytes()
+
+
+def _lin2alaw_fallback(data: bytes) -> bytes:
+    """PCM16 → G.711a 纯 Python 实现（仅测试用）。"""
+    samples = np.frombuffer(data, dtype=np.int16)
+    out = np.array([_encode_alaw_sample(int(s)) for s in samples], dtype=np.uint8)
+    return out.tobytes()
+
+
+def _build_alaw_table():
+    """构建 G.711a 解码查找表（256 个条目）。"""
+    table = np.zeros(256, dtype=np.int16)
+    for i in range(256):
+        a = i ^ 0x55
+        seg = (a & 0x70) >> 4
+        val = a & 0x0F
+        if seg == 0:
+            val = (val << 1) | 1
+        else:
+            val = ((val | 0x10) << seg)
+        table[i] = -val if (a & 0x80) == 0 else val
+    return table
+
+
+def _encode_alaw_sample(sample: int) -> int:
+    sign = 0 if sample < 0 else 0x80
+    if sample < 0:
+        sample = -sample - 1
+    sample = min(sample, 32767)
+    if sample < 256:
+        encoded = sample >> 4
+        seg = 0
+    else:
+        for seg in range(1, 8):
+            if sample < (256 << seg):
+                break
+        encoded = (sample >> (seg + 3)) & 0x0F
+    return (sign | (seg << 4) | encoded) ^ 0x55
+
+
+_alaw2lin_bytes, _lin2alaw_bytes = _load_alaw_codec()
+
+
+# ── 重采样 ───────────────────────────────────────────────────────────────
+
+def _load_resample():
+    """按优先级加载重采样实现。"""
+
+    # 方案 1：soxr（最高质量，推荐）
+    try:
+        import soxr
+
+        def _resample(data: np.ndarray, src: int, dst: int) -> np.ndarray:
+            if src == dst:
+                return data
+            out = soxr.resample(
+                data.astype(np.float32), src, dst, quality="HQ"
+            )
+            return np.clip(out, -32768, 32767).astype(np.int16)
+
+        logger.debug("Resampler: soxr (HQ)")
+        return _resample
+    except ImportError:
+        pass
+
+    # 方案 2：scipy
+    try:
+        from scipy import signal as _signal
+
+        def _resample(data: np.ndarray, src: int, dst: int) -> np.ndarray:
+            if src == dst:
+                return data
+            from math import gcd
+            g   = gcd(src, dst)
+            up  = dst // g
+            down = src // g
+            out = _signal.resample_poly(data.astype(np.float64), up, down)
+            return np.clip(out, -32768, 32767).astype(np.int16)
+
+        logger.debug("Resampler: scipy.signal.resample_poly")
+        return _resample
+    except ImportError:
+        pass
+
+    # 方案 3：线性插值（最差，有明显失真）
+    logger.warning(
+        "No high-quality resampler found. Using linear interpolation. "
+        "Install: pip install soxr"
+    )
+
+    def _resample(data: np.ndarray, src: int, dst: int) -> np.ndarray:
+        if src == dst:
+            return data
+        ratio      = dst / src
+        new_length = int(len(data) * ratio)
+        if new_length == 0:
+            return np.zeros(1, dtype=np.int16)
+        indices = np.linspace(0, len(data) - 1, new_length)
+        out     = np.interp(indices, np.arange(len(data)), data)
+        return np.clip(out, -32768, 32767).astype(np.int16)
+
+    return _resample
+
+
+RESAMPLE_FUNC = _load_resample()
+
+
+# ── 公开接口 ─────────────────────────────────────────────────────────────
+
+def pcma_to_pcm(pcma_bytes: bytes) -> np.ndarray:
+    """
+    G.711a（A-law）字节串 → PCM16LE ndarray。
+
+    Args:
+        pcma_bytes: G.711a 编码的字节数据
+    Returns:
+        PCM16LE numpy 数组
+    """
+    pcm_bytes = _alaw2lin_bytes(pcma_bytes)
+    return np.frombuffer(pcm_bytes, dtype=np.int16).copy()
+
+
+def pcm_to_pcma(pcm: np.ndarray) -> bytes:
+    """
+    PCM16LE ndarray → G.711a（A-law）字节串。
+
+    Args:
+        pcm: PCM16LE numpy 数组
+    Returns:
+        G.711a 编码的字节数据
+    """
+    pcm_bytes = pcm.astype(np.int16).tobytes()
+    return _lin2alaw_bytes(pcm_bytes)
+
+
+def log_audio_backend():
+    """启动时打印音频后端信息（供 main.py 调用）。"""
+    py_ver = sys.version_info
+    logger.info(
+        f"Audio backend ready | "
+        f"Python {py_ver.major}.{py_ver.minor}.{py_ver.micro}"
+    )
+```
+
+---
+
+## `audio.py`
+
+```python
+"""
+audio.py  ─  音频格式转换与帧缓冲 v3.0
+
+常量：
+  FS_RATE    = 8 000 Hz   G.711a（FreeSWITCH）
+  AI_RATE    = 16 000 Hz  PCM16LE（AI 模型）
+  FRAME_MS   = 20 ms      标准帧时长
+  FRAME_PCMA = 160 B      20ms G.711a@8kHz（1 byte/sample）
+"""
+
+import logging
+from typing import List
+
+import numpy as np
+
+from audio_utils import pcma_to_pcm, pcm_to_pcma, RESAMPLE_FUNC
+
+logger = logging.getLogger("Audio")
+
+# ── 采样率与帧大小常量 ───────────────────────────────────────────────────
+FS_RATE      = 8_000
+AI_RATE      = 16_000
+FRAME_MS     = 20
+FRAME_PCMA   = FS_RATE  * FRAME_MS // 1000 * 1    # 160 bytes
+FRAME_PCM8K  = FS_RATE  * FRAME_MS // 1000 * 2    # 320 bytes
+FRAME_PCM16K = AI_RATE  * FRAME_MS // 1000 * 2    # 640 bytes
+
+
+class AudioConverter:
+    """
+    FreeSWITCH <-> AI 音频格式转换。
+    无状态，线程安全，可在任意线程调用。
+    """
+
+    @staticmethod
+    def fs_to_ai(pcma_bytes: bytes) -> bytes:
+        """
+        G.711a 8kHz -> PCM16LE 16kHz。
+
+        Args:
+            pcma_bytes: G.711a 编码字节（任意长度）
+        Returns:
+            PCM16LE 字节串（适合直接发给 AI）
+        """
+        if not pcma_bytes:
+            return b""
+        pcm_8k  = pcma_to_pcm(pcma_bytes)
+        pcm_16k = RESAMPLE_FUNC(pcm_8k, FS_RATE, AI_RATE)
+        return pcm_16k.astype(np.int16).tobytes()
+
+    @staticmethod
+    def ai_to_fs(pcm16_bytes: bytes) -> bytes:
+        """
+        PCM16LE 16kHz -> G.711a 8kHz。
+
+        Args:
+            pcm16_bytes: PCM16LE 字节串（任意长度）
+        Returns:
+            G.711a 编码字节
+        """
+        if not pcm16_bytes:
+            return b""
+        pcm_16k = np.frombuffer(pcm16_bytes, dtype=np.int16)
+        pcm_8k  = RESAMPLE_FUNC(pcm_16k, AI_RATE, FS_RATE).astype(np.int16)
+        return pcm_to_pcma(pcm_8k)
+
+
+class AudioFrameBuffer:
+    """
+    将 AI 返回的变长 PCM16LE 音频块切割为标准 20ms PCMA 帧。
+
+    使用方式（每个 session 独立实例，非线程安全）：
+        buf = AudioFrameBuffer()
+        buf.push_pcm16(chunk)        # AI 回调中调用
+        frames = buf.pop_frames()    # 取出所有完整的 20ms 帧
+        tail = buf.flush()           # turn_done 时取出剩余数据
+        buf.clear()                  # barge-in 时清空
+    """
+
+    def __init__(self):
+        self._raw = bytearray()
+
+    def push_pcm16(self, pcm16_bytes: bytes):
+        """接收 PCM16LE，转换为 PCMA 后追加到内部缓冲区。"""
+        if not pcm16_bytes:
+            return
+        pcma = AudioConverter.ai_to_fs(pcm16_bytes)
+        self._raw.extend(pcma)
+
+    def pop_frames(self) -> List[bytes]:
+        """
+        弹出所有完整的 20ms PCMA 帧（每帧 160 字节）。
+        剩余不足一帧的数据留在缓冲区中。
+        """
+        frames = []
+        while len(self._raw) >= FRAME_PCMA:
+            frames.append(bytes(self._raw[:FRAME_PCMA]))
+            del self._raw[:FRAME_PCMA]
+        return frames
+
+    def flush(self) -> bytes:
+        """
+        取出缓冲区中全部剩余数据（不足一帧的尾部）并清空。
+        在 AI 本轮回复结束（turn_done）时调用，确保尾部不丢失。
+        """
+        remaining = bytes(self._raw)
+        self._raw.clear()
+        return remaining
+
+    def clear(self):
+        """清空缓冲区（barge-in 时调用）。"""
+        self._raw.clear()
+
+    def __len__(self) -> int:
+        return len(self._raw)
+```
+
+---
+
+## `esl.py`
+
+```python
+"""
+esl.py  ─  FreeSWITCH ESL 连接 v3.0
+
+修复：
+  [1] 单一读取线程，彻底消除 socket 竞态
+  [2] Content-Type 路由，api/response → Queue，event-plain → 回调
+  [3] BACKGROUND_JOB 内层 body 正确解析（\\n\\n → \n\n）
+  [4] subscribe 通过专用 _cmd_reply_q 等待确认
+  [5] ESL 断线自动重连（指数退避）
+  [6] 重连后自动重新订阅
+"""
+
+import logging
+import queue
+import socket
+import threading
+import time
+import uuid as uuid_mod
+from concurrent.futures import ThreadPoolExecutor
+from typing import Callable, Dict, List, Optional, Tuple
+from urllib.parse import unquote
+
+import config
+
+logger = logging.getLogger("ESL")
+
+
+class ESLError(Exception):
+    pass
+
+
+class ESLConnection:
+    """
+    线程安全的 FreeSWITCH ESL 连接。
+
+    消息流（事件循环线程是唯一读取 socket 的地方）：
+        写：send_command / send_bgapi
+              → _send_lock
+              → socket.sendall
+        读：_event_loop（唯一）
+              → Content-Type 路由
+              → api/response     → _api_resp_q
+              → command/reply    → _cmd_reply_q
+              → text/event-plain → _dispatch_event → 回调线程池
+    """
+
+    CMD_TIMEOUT   = 10
+    BGAPI_TIMEOUT = 30
+    SUB_TIMEOUT   = 5
+    RECV_BUF_SIZE = 65536
+
+    def __init__(self, host: str, port: int, password: str):
+        self.host     = host
+        self.port     = port
+        self.password = password
+
+        self._sock: Optional[socket.socket] = None
+        self._buf        = b""
+        self._connected  = False
+        self._running    = False
+
+        # 发送互斥锁
+        self._send_lock = threading.Lock()
+
+        # 响应队列
+        self._api_resp_q:  queue.Queue = queue.Queue()
+        self._cmd_reply_q: queue.Queue = queue.Queue()
+
+        # bgapi job_uuid → Queue 路由表
+        self._bgapi_pending: Dict[str, queue.Queue] = {}
+        self._bgapi_lock    = threading.Lock()
+
+        # 事件回调注册表
+        self._callbacks: Dict[str, List[Callable]] = {}
+
+        # 回调线程池（与读取线程解耦，避免慢回调阻塞读取）
+        self._executor = ThreadPoolExecutor(
+            max_workers=8,
+            thread_name_prefix="esl-cb",
+        )
+
+        self._reader_thread: Optional[threading.Thread] = None
+
+        # 重连状态
+        self._subscribed_events: List[str] = []
+        self._reconnect_count = 0
+
+    # ------------------------------------------------------------------ #
+    #  属性
+    # ------------------------------------------------------------------ #
+
+    @property
+    def connected(self) -> bool:
+        return self._connected
+
+    # ------------------------------------------------------------------ #
+    #  公开接口
+    # ------------------------------------------------------------------ #
+
+    def connect(self) -> bool:
+        """
+        建立 TCP 连接并完成 ESL auth 握手。
+        事件循环启动前调用，直接读写 socket 安全。
+        """
+        try:
+            self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self._sock.settimeout(10)
+            self._sock.connect((self.host, self.port))
+            self._sock.settimeout(None)
+            self._buf = b""
+
+            # 等待 auth/request
+            headers = self._read_headers()
+            ct = headers.get("Content-Type", "")
+            if ct != "auth/request":
+                raise ESLError(f"Unexpected greeting: {ct!r}")
+
+            # 发送密码
+            self._raw_send(f"auth {self.password}\n\n")
+
+            # 读取 command/reply
+            headers = self._read_headers()
+            reply   = headers.get("Reply-Text", "")
+            if not reply.startswith("+OK"):
+                raise ESLError(f"Auth failed: {reply!r}")
+
+            self._connected = True
+            logger.info(f"ESL connected → {self.host}:{self.port}")
+            return True
+
+        except Exception as e:
+            logger.error(f"ESL connect failed: {e}")
+            try:
+                self._sock.close()
+            except Exception:
+                pass
+            self._connected = False
+            return False
+
+    def start(self):
+        """启动后台事件循环线程，必须在 connect() 成功后调用。"""
+        self._running = True
+        self._reader_thread = threading.Thread(
+            target=self._event_loop,
+            name="esl-reader",
+            daemon=True,
+        )
+        self._reader_thread.start()
+
+    def stop(self):
+        """优雅关闭。"""
+        self._running   = False
+        self._connected = False
+        if self._sock:
+            try:
+                self._sock.close()
+            except Exception:
+                pass
+        self._executor.shutdown(wait=False)
+
+    def subscribe(self, *events: str):
+        """
+        订阅 ESL 事件，等待 command/reply 确认后返回。
+        缓存订阅列表以便断线重连后恢复。
+        """
+        self._subscribed_events = list(events)
+        self._do_subscribe(events)
+
+    def _do_subscribe(self, events):
+        event_str = " ".join(events)
+        with self._send_lock:
+            self._raw_send(f"event plain {event_str}\n\n")
+        try:
+            reply = self._cmd_reply_q.get(timeout=self.SUB_TIMEOUT)
+            if "+OK" not in reply:
+                logger.warning(f"subscribe reply unexpected: {reply!r}")
+            else:
+                logger.info(f"ESL subscribed: {event_str}")
+        except queue.Empty:
+            logger.warning("subscribe: no reply within timeout")
+
+    def on(self, event_name: str, callback: Callable):
+        """注册事件回调，线程安全。"""
+        self._callbacks.setdefault(event_name, []).append(callback)
+
+    def send_command(self, cmd: str) -> str:
+        """
+        发送同步 api 命令，阻塞等待响应。
+        线程安全，可从任意线程调用。
+        """
+        with self._send_lock:
+            self._raw_send(f"api {cmd}\n\n")
+        try:
+            return self._api_resp_q.get(timeout=self.CMD_TIMEOUT)
+        except queue.Empty:
+            raise ESLError(f"api command timeout: {cmd!r}")
+
+    def send_bgapi(self, cmd: str) -> str:
+        """
+        发送 bgapi 命令，阻塞等待 BACKGROUND_JOB 结果。
+        线程安全，可从任意线程调用。
+        """
+        job_uuid = str(uuid_mod.uuid4())
+        resp_q: queue.Queue = queue.Queue()
+
+        with self._bgapi_lock:
+            self._bgapi_pending[job_uuid] = resp_q
+
+        try:
+            with self._send_lock:
+                self._raw_send(
+                    f"bgapi {cmd}\nJob-UUID: {job_uuid}\n\n"
+                )
+            return resp_q.get(timeout=self.BGAPI_TIMEOUT)
+        except queue.Empty:
+            raise ESLError(f"bgapi timeout: {cmd!r}")
+        finally:
+            with self._bgapi_lock:
+                self._bgapi_pending.pop(job_uuid, None)
+
+    def send_bgapi_nowait(self, cmd: str):
+        """发送 bgapi，不等待结果（fire-and-forget）。线程安全。"""
+        job_uuid = str(uuid_mod.uuid4())
+        with self._send_lock:
+            self._raw_send(
+                f"bgapi {cmd}\nJob-UUID: {job_uuid}\n\n"
+            )
+
+    # ------------------------------------------------------------------ #
+    #  内部：socket 读写原语
+    # ------------------------------------------------------------------ #
+
+    def _raw_send(self, data: str):
+        """直接写 socket。调用方必须持有 _send_lock（connect 阶段除外）。"""
+        self._sock.sendall(data.encode("utf-8"))
+
+    def _read_exactly(self, n: int) -> bytes:
+        """从内部缓冲区读取精确 n 字节。"""
+        while len(self._buf) < n:
+            chunk = self._sock.recv(self.RECV_BUF_SIZE)
+            if not chunk:
+                raise ConnectionError("ESL socket closed")
+            self._buf += chunk
+        data, self._buf = self._buf[:n], self._buf[n:]
+        return data
+
+    def _read_line(self) -> str:
+        """读取一行（以 \\n 结尾），返回去除首尾空白的字符串。"""
+        while b"\n" not in self._buf:
+            chunk = self._sock.recv(self.RECV_BUF_SIZE)
+            if not chunk:
+                raise ConnectionError("ESL socket closed")
+            self._buf += chunk
+        idx         = self._buf.index(b"\n")
+        line, self._buf = self._buf[:idx], self._buf[idx + 1:]
+        return line.decode("utf-8", errors="replace").strip()
+
+    def _read_headers(self) -> Dict[str, str]:
+        """
+        读取 ESL 头部块（连续 key: value 行，以空行结束）。
+        对值做 URL 解码（ESL 对特殊字符做 %XX 编码）。
+        """
+        headers: Dict[str, str] = {}
+        while True:
+            line = self._read_line()
+            if line == "":
+                break
+            if ": " in line:
+                k, v = line.split(": ", 1)
+                headers[k.strip()] = unquote(v.strip())
+        return headers
+
+    def _read_body(self, length: int) -> str:
+        """按 Content-Length 读取消息体。"""
+        if length <= 0:
+            return ""
+        return self._read_exactly(length).decode("utf-8", errors="replace")
+
+    # ------------------------------------------------------------------ #
+    #  内部：事件循环（唯一读取 socket 的线程）
+    # ------------------------------------------------------------------ #
+
+    def _event_loop(self):
+        """
+        永久循环，按 Content-Type 路由每条 ESL 消息。
+
+        Content-Type            路由
+        ─────────────────────── ────────────────────────────
+        auth/request            忽略（connect 阶段已处理）
+        command/reply           → _cmd_reply_q
+        api/response            → _api_resp_q
+        text/event-plain        → _dispatch_event()
+        text/disconnect-notice  → 触发重连
+        """
+        logger.info("ESL event loop started")
+        while self._running:
+            try:
+                headers = self._read_headers()
+                if not headers:
+                    continue
+
+                ct   = headers.get("Content-Type", "")
+                cl   = int(headers.get("Content-Length", 0))
+                body = self._read_body(cl)
+
+                if ct == "api/response":
+                    self._api_resp_q.put(body.strip())
+
+                elif ct == "command/reply":
+                    reply = headers.get("Reply-Text", body.strip())
+                    self._cmd_reply_q.put(reply)
+
+                elif ct == "text/event-plain":
+                    self._dispatch_event(body)
+
+                elif ct == "text/disconnect-notice":
+                    logger.warning("ESL disconnect notice received")
+                    self._connected = False
+                    break
+
+                elif ct == "auth/request":
+                    pass  # 重连时可能再次收到，忽略
+
+                else:
+                    if ct:
+                        logger.debug(f"ESL unhandled Content-Type: {ct!r}")
+
+            except ConnectionError as e:
+                logger.error(f"ESL connection lost: {e}")
+                break
+            except Exception as e:
+                if self._running:
+                    logger.exception(f"ESL event loop error: {e}")
+                    time.sleep(0.05)
+
+        self._connected = False
+        logger.warning("ESL event loop exited")
+
+        # 触发自动重连
+        if self._running:
+            self._schedule_reconnect()
+
+    def _dispatch_event(self, body: str):
+        """
+        解析 text/event-plain 消息体，路由到回调或 bgapi 等待队列。
+
+        ESL text/event-plain 格式：
+          body = 事件头部（key: value 行）+ 空行 + 内层 body
+          内层 body 长度由事件头部的 Content-Length 指定
+          BACKGROUND_JOB 的执行结果在内层 body 中
+        """
+        # 解析事件头部（body 中第一个空行之前）
+        event_headers: Dict[str, str] = {}
+        lines = body.split("\n")
+        split_idx = len(lines)
+
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if stripped == "":
+                split_idx = i
+                break
+            if ": " in stripped:
+                k, v = stripped.split(": ", 1)
+                event_headers[k.strip()] = unquote(v.strip())
+
+        # 解析内层 body
+        # 修复：使用真正的 \n\n（两个换行符），不是转义序列
+        inner_cl   = int(event_headers.get("Content-Length", 0))
+        inner_body = ""
+        if inner_cl > 0:
+            # 在原始 body 字符串中定位空行分隔符
+            split_pos = body.find("\n\n")
+            if split_pos != -1:
+                inner_body = body[split_pos + 2: split_pos + 2 + inner_cl]
+            else:
+                # 部分 ESL 实现用单换行分隔
+                split_pos = body.find("\n")
+                if split_pos != -1:
+                    inner_body = body[split_pos + 1: split_pos + 1 + inner_cl]
+
+        event_name = event_headers.get("Event-Name", "")
+
+        # BACKGROUND_JOB：路由给等待的 send_bgapi 调用
+        if event_name == "BACKGROUND_JOB":
+            job_uuid = event_headers.get("Job-UUID", "")
+            with self._bgapi_lock:
+                resp_q = self._bgapi_pending.get(job_uuid)
+            if resp_q is not None:
+                resp_q.put(inner_body.strip())
+            return
+
+        # 普通事件：在线程池执行回调，不阻塞读取循环
+        callbacks = self._callbacks.get(event_name, [])
+        if callbacks:
+            event = {
+                "headers": event_headers,
+                "body":    inner_body,
+            }
+            for cb in callbacks:
+                self._executor.submit(self._safe_call, cb, event)
+
+    @staticmethod
+    def _safe_call(cb: Callable, event: dict):
+        try:
+            cb(event)
+        except Exception as e:
+            logger.exception(f"ESL callback error [{cb.__name__}]: {e}")
+
+    # ------------------------------------------------------------------ #
+    #  内部：断线重连
+    # ------------------------------------------------------------------ #
+
+    def _schedule_reconnect(self):
+        """在独立线程中执行重连，不阻塞事件循环线程。"""
+        t = threading.Thread(
+            target=self._reconnect_loop,
+            name="esl-reconnect",
+            daemon=True,
+        )
+        t.start()
+
+    def _reconnect_loop(self):
+        """指数退避重连，成功后重新订阅事件。"""
+        max_retries = getattr(config, "ESL_MAX_RECONNECTS", 0)
+        interval    = getattr(config, "ESL_RECONNECT_INTERVAL", 5)
+        attempt     = 0
+
+        while self._running:
+            attempt += 1
+            if max_retries > 0 and attempt > max_retries:
+                logger.error(f"ESL max reconnects ({max_retries}) reached, giving up")
+                return
+
+            # 指数退避：5s, 10s, 20s, 最大 60s
+            wait = min(interval * (2 ** (attempt - 1)), 60)
+            logger.info(f"ESL reconnect attempt {attempt} in {wait}s...")
+            time.sleep(wait)
+
+            if not self._running:
+                return
+
+            logger.info(f"ESL reconnecting to {self.host}:{self.port}...")
+            if self.connect():
+                self._reconnect_count += 1
+                logger.info(
+                    f"ESL reconnected (attempt {attempt}, "
+                    f"total reconnects: {self._reconnect_count})"
+                )
+                # 重新订阅之前订阅过的事件
+                if self._subscribed_events:
+                    self._do_subscribe(self._subscribed_events)
+                # 重启事件循环线程
+                self.start()
+                return
+            else:
+                logger.warning(f"ESL reconnect attempt {attempt} failed")
+```
+
+---
+
+## `ai_client.py`
+
+```python
+"""
+ai_client.py  ─  MiniCPM-o WebSocket 客户端 v3.0
+
+修复：
+  [1] 移除错误的 _make_socket / sock= 参数，改为连接后设置 TCP_NODELAY
+  [2] 发送队列化：_send_loop 串行发出，避免并发写 WebSocket
+  [3] 连接状态机：DISCONNECTED / CONNECTING / READY / CLOSING
+  [4] 首帧延迟计时（供 Prometheus 使用）
+  [5] 所有回调异常隔离
+"""
+
+import asyncio
+import base64
+import json
+import logging
+import socket as _socket
+import time
+from enum import Enum, auto
+from typing import Callable, Optional
+
+import websockets
+import websockets.exceptions
+
+import config
+
+logger = logging.getLogger("AIClient")
+
+_SEND_TIMEOUT    = 5.0
+_CONNECT_TIMEOUT = 10.0
+_HANDSHAKE_TIMEOUT = 15.0
+_SEND_QUEUE_SIZE = 200
+
+
+class ClientState(Enum):
+    DISCONNECTED = auto()
+    CONNECTING   = auto()
+    READY        = auto()
+    CLOSING      = auto()
+
+
+class AIClient:
+    """
+    封装与 MiniCPM-o 的 WebSocket 会话。
+
+    线程模型：
+      - 所有方法均为协程，运行在同一事件循环
+      - send_audio / send_text 将消息放入 _send_queue
+      - _send_loop 串行从队列取出并发送（WebSocket 不支持并发写）
+
+    回调（在事件循环线程同步调用，必须快速返回）：
+      on_audio_chunk(pcm16_bytes: bytes)
+      on_turn_done()
+      on_speech_started()
+      on_transcript(text: str)
+      on_error(reason: str)
+      on_connected()
+    """
+
+    def __init__(self, session_id: str):
+        self.session_id = session_id
+        self.mode: str  = config.AI_MODE
+
+        self._state      = ClientState.DISCONNECTED
+        self._ws         = None
+        self._send_queue: asyncio.Queue = asyncio.Queue(
+            maxsize=_SEND_QUEUE_SIZE
+        )
+
+        self._recv_task: Optional[asyncio.Task] = None
+        self._send_task: Optional[asyncio.Task] = None
+
+        # 延迟测量
+        self._connect_start:    float = 0.0
+        self._first_audio_recv: float = 0.0
+
+        # 回调
+        self.on_audio_chunk:    Optional[Callable[[bytes], None]] = None
+        self.on_turn_done:      Optional[Callable[[], None]]      = None
+        self.on_speech_started: Optional[Callable[[], None]]      = None
+        self.on_transcript:     Optional[Callable[[str], None]]   = None
+        self.on_error:          Optional[Callable[[str], None]]   = None
+        self.on_connected:      Optional[Callable[[], None]]      = None
+
+    # ------------------------------------------------------------------ #
+    #  属性
+    # ------------------------------------------------------------------ #
+
+    @property
+    def connected(self) -> bool:
+        return self._state == ClientState.READY
+
+    @property
+    def latency_connect_ms(self) -> float:
+        """从开始连接到收到首帧音频的耗时（毫秒）。"""
+        if self._first_audio_recv > 0 and self._connect_start > 0:
+            return (self._first_audio_recv - self._connect_start) * 1000
+        return -1.0
+
+    # ------------------------------------------------------------------ #
+    #  生命周期
+    # ------------------------------------------------------------------ #
+
+    async def connect(self) -> bool:
+        """
+        建立 WebSocket 连接并完成握手。
+        修复：不传 sock= 参数，连接建立后再设置 TCP_NODELAY。
+        """
+        if self._state != ClientState.DISCONNECTED:
+            logger.warning(
+                f"[{self.session_id}] connect() in state {self._state}"
+            )
+            return False
+
+        self._state         = ClientState.CONNECTING
+        self._connect_start = time.monotonic()
+
+        extra_headers = {}
+        if self.mode == "cloud":
+            extra_headers["Authorization"] = (
+                f"Bearer {config.CLOUD_API_KEY}"
+            )
+
+        try:
+            self._ws = await asyncio.wait_for(
+                websockets.connect(
+                    config.MINICPM_WS_URL,
+                    extra_headers=extra_headers,
+                    ping_interval=20,
+                    ping_timeout=10,
+                    max_size=16 * 1024 * 1024,
+                    compression=None,   # 关闭压缩，降低 CPU 和延迟
+                ),
+                timeout=_CONNECT_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            logger.error(f"[{self.session_id}] AI connect timeout")
+            self._state = ClientState.DISCONNECTED
+            return False
+        except Exception as e:
+            logger.error(f"[{self.session_id}] AI connect failed: {e}")
+            self._state = ClientState.DISCONNECTED
+            return False
+
+        # 连接建立后设置 TCP_NODELAY（修复：不在 connect 之前操作 socket）
+        self._set_tcp_nodelay()
+
+        # 协议握手
+        try:
+            await asyncio.wait_for(
+                self._handshake(),
+                timeout=_HANDSHAKE_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            logger.error(f"[{self.session_id}] AI handshake timeout")
+            await self._ws.close()
+            self._state = ClientState.DISCONNECTED
+            return False
+        except Exception as e:
+            logger.error(f"[{self.session_id}] AI handshake failed: {e}")
+            await self._ws.close()
+            self._state = ClientState.DISCONNECTED
+            return False
+
+        # 启动后台任务
+        self._recv_task = asyncio.create_task(
+            self._recv_loop(),
+            name=f"ai-recv-{self.session_id[:8]}",
+        )
+        self._send_task = asyncio.create_task(
+            self._send_loop(),
+            name=f"ai-send-{self.session_id[:8]}",
+        )
+
+        self._state = ClientState.READY
+        elapsed = (time.monotonic() - self._connect_start) * 1000
+        logger.info(
+            f"[{self.session_id}] AI ready ({elapsed:.0f}ms)"
+        )
+
+        self._fire(self.on_connected)
+        return True
+
+    def _set_tcp_nodelay(self):
+        """
+        对已建立的 WebSocket 连接设置 TCP_NODELAY。
+        修复：在连接建立后从 transport 获取 socket，不在连接前操作。
+        """
+        try:
+            transport = self._ws.transport
+            if transport is None:
+                return
+            sock = transport.get_extra_info("socket")
+            if sock is None:
+                return
+            sock.setsockopt(
+                _socket.IPPROTO_TCP,
+                _socket.TCP_NODELAY,
+                1,
+            )
+            sock.setsockopt(
+                _socket.SOL_SOCKET,
+                _socket.SO_KEEPALIVE,
+                1,
+            )
+            logger.debug(f"[{self.session_id}] TCP_NODELAY set")
+        except Exception as e:
+            logger.debug(f"[{self.session_id}] TCP_NODELAY failed: {e}")
+
+    async def close(self):
+        """优雅关闭，幂等。"""
+        if self._state == ClientState.CLOSING:
+            return
+        prev_state  = self._state
+        self._state = ClientState.CLOSING
+
+        # 向发送队列注入毒丸
+        try:
+            self._send_queue.put_nowait(None)
+        except asyncio.QueueFull:
+            pass
+
+        for task in (self._send_task, self._recv_task):
+            if task and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
+        if self._ws:
+            try:
+                await asyncio.wait_for(self._ws.close(), timeout=2.0)
+            except Exception:
+                pass
+            self._ws = None
+
+        self._state = ClientState.DISCONNECTED
+        logger.info(f"[{self.session_id}] AI client closed")
+
+    # ------------------------------------------------------------------ #
+    #  发送接口（入队，由 _send_loop 串行发出）
+    # ------------------------------------------------------------------ #
+
+    async def send_audio(self, pcm16_bytes: bytes):
+        """发送用户音频（PCM16LE bytes）。非阻塞入队。"""
+        if self._state != ClientState.READY or not pcm16_bytes:
+            return
+
+        if self.mode == "cloud":
+            msg = json.dumps({
+                "type":  "input_audio_buffer.append",
+                "audio": base64.b64encode(pcm16_bytes).decode(),
+            })
+        else:
+            msg = pcm16_bytes
+
+        await self._enqueue(msg)
+
+    async def send_text(self, text: str):
+        """发送文本消息。"""
+        if self._state != ClientState.READY:
+            return
+        if self.mode == "cloud":
+            for msg in (
+                json.dumps({
+                    "type": "conversation.item.create",
+                    "item": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": text}],
+                    },
+                }),
+                json.dumps({"type": "response.create"}),
+            ):
+                await self._enqueue(msg)
+        else:
+            await self._enqueue(
+                json.dumps({"type": "text_input", "text": text})
+            )
+
+    async def interrupt(self):
+        """
+        打断 AI 当前输出。
+        高优先级：直接发送，不经过发送队列。
+        """
+        if self._state != ClientState.READY:
+            return
+        try:
+            if self.mode == "cloud":
+                payload = json.dumps({"type": "input_audio_buffer.clear"})
+            else:
+                payload = json.dumps({"type": "barge_in"})
+            await asyncio.wait_for(
+                self._ws.send(payload),
+                timeout=_SEND_TIMEOUT,
+            )
+        except Exception as e:
+            logger.error(f"[{self.session_id}] interrupt error: {e}")
+
+    # ------------------------------------------------------------------ #
+    #  内部：握手
+    # ------------------------------------------------------------------ #
+
+    async def _handshake(self):
+        if self.mode == "cloud":
+            await self._handshake_cloud()
+        else:
+            await self._handshake_local()
+
+    async def _handshake_cloud(self):
+        async for raw in self._ws:
+            data = json.loads(raw)
+            if data.get("type") == "session.created":
+                break
+
+        await self._ws.send(json.dumps({
+            "type": "session.update",
+            "session": {
+                "instructions":        config.AI_SYSTEM_PROMPT,
+                "voice":               config.AI_VOICE,
+                "input_audio_format":  "pcm16",
+                "output_audio_format": "pcm16",
+                "turn_detection": {
+                    "type":                "server_vad",
+                    "threshold":           0.5,
+                    "silence_duration_ms": 600,
+                },
+                "input_audio_transcription": {
+                    "model":    "whisper-1",
+                    "language": "zh",
+                },
+            },
+        }))
+
+        async for raw in self._ws:
+            data = json.loads(raw)
+            if data.get("type") == "session.updated":
+                break
+
+    async def _handshake_local(self):
+        await self._ws.send(json.dumps({
+            "type":        "init",
+            "session_id":  self.session_id,
+            "sample_rate": config.AI_SAMPLE_RATE,
+            "channels":    1,
+            "format":      "pcm_s16le",
+        }))
+        # 等待本地服务端确认
+        async for raw in self._ws:
+            if isinstance(raw, str):
+                try:
+                    data = json.loads(raw)
+                    if data.get("type") in ("ready", "init_ok"):
+                        break
+                except json.JSONDecodeError:
+                    pass
+            # 超时由外层 wait_for 控制
+
+    # ------------------------------------------------------------------ #
+    #  内部：发送循环（串行，WebSocket 不支持并发写）
+    # ------------------------------------------------------------------ #
+
+    async def _send_loop(self):
+        """
+        从 _send_queue 串行取消息发送。
+        串行是必须的：websockets 库不支持多个协程同时调用 ws.send()。
+        """
+        while True:
+            try:
+                msg = await self._send_queue.get()
+            except asyncio.CancelledError:
+                break
+
+            if msg is None:   # 毒丸：退出信号
+                break
+
+            try:
+                await asyncio.wait_for(
+                    self._ws.send(msg),
+                    timeout=_SEND_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    f"[{self.session_id}] send timeout, dropping"
+                )
+            except websockets.exceptions.ConnectionClosed:
+                logger.warning(
+                    f"[{self.session_id}] WS closed during send"
+                )
+                self._state = ClientState.DISCONNECTED
+                break
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"[{self.session_id}] send error: {e}")
+
+    # ------------------------------------------------------------------ #
+    #  内部：接收循环
+    # ------------------------------------------------------------------ #
+
+    async def _recv_loop(self):
+        try:
+            async for msg in self._ws:
+                if self._state == ClientState.CLOSING:
+                    break
+                if isinstance(msg, bytes):
+                    self._on_binary(msg)
+                else:
+                    self._dispatch_json(msg)
+
+        except asyncio.CancelledError:
+            pass
+        except websockets.exceptions.ConnectionClosed as e:
+            logger.warning(
+                f"[{self.session_id}] AI WS closed: "
+                f"code={e.code} reason={e.reason!r}"
+            )
+        except Exception as e:
+            logger.exception(
+                f"[{self.session_id}] recv loop error: {e}"
+            )
+        finally:
+            if self._state == ClientState.READY:
+                self._state = ClientState.DISCONNECTED
+                self._fire(self.on_error, "connection_lost")
+
+    def _on_binary(self, data: bytes):
+        """本地模式：收到二进制 PCM16 音频。"""
+        self._record_first_audio()
+        self._fire(self.on_audio_chunk, data)
+
+    def _dispatch_json(self, raw: str):
+        """解析并分发 JSON 消息。"""
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            logger.warning(
+                f"[{self.session_id}] invalid JSON: {raw[:80]!r}"
+            )
+            return
+
+        t = data.get("type", "")
+
+        if t == "response.output_audio.delta":
+            chunk = base64.b64decode(data.get("delta", ""))
+            if chunk:
+                self._record_first_audio()
+                self._fire(self.on_audio_chunk, chunk)
+
+        elif t == "response.output_audio.done":
+            self._fire(self.on_turn_done)
+
+        elif t == "input_audio_buffer.speech_started":
+            self._fire(self.on_speech_started)
+
+        elif t == "conversation.item.input_audio_transcription.completed":
+            text = data.get("transcript", "").strip()
+            if text:
+                self._fire(self.on_transcript, text)
+
+        elif t == "error":
+            err = data.get("error", {})
+            logger.error(f"[{self.session_id}] AI error: {err}")
+            self._fire(self.on_error, str(err))
+
+    # ------------------------------------------------------------------ #
+    #  内部：工具
+    # ------------------------------------------------------------------ #
+
+    def _record_first_audio(self):
+        """记录首帧音频时间（只记录一次）。"""
+        if self._first_audio_recv == 0:
+            self._first_audio_recv = time.monotonic()
+            elapsed = (
+                self._first_audio_recv - self._connect_start
+            ) * 1000
+            logger.info(
+                f"[{self.session_id}] First AI audio: {elapsed:.0f}ms"
+            )
+
+    async def _enqueue(self, msg):
+        """入队，队满时丢弃最旧消息（保实时性）。"""
+        try:
+            self._send_queue.put_nowait(msg)
+        except asyncio.QueueFull:
+            try:
+                self._send_queue.get_nowait()
+                self._send_queue.put_nowait(msg)
+            except (asyncio.QueueEmpty, asyncio.QueueFull):
+                pass
+
+    def _fire(self, cb: Optional[Callable], *args):
+        """安全调用回调，异常隔离，不影响调用方。"""
+        if cb is None:
+            return
+        try:
+            cb(*args)
+        except Exception as e:
+            logger.exception(
+                f"[{self.session_id}] callback {cb.__name__} error: {e}"
+            )
+```
+
+---
+
+## `metrics.py`
+
+```python
+"""
+metrics.py  ─  Prometheus 监控指标 v1.0
+
+用途：
+  暴露 HTTP /metrics 端点，Prometheus 定时抓取，Grafana 展示。
+
+安装：
+  pip install prometheus-client
+
+Prometheus 配置（prometheus.yml）：
+  scrape_configs:
+    - job_name: minicpm_gateway
+      static_configs:
+        - targets: ['localhost:9090']
+      scrape_interval: 15s
+
+常用 Grafana 查询：
+  活跃通话数    : minicpm_active_calls
+  每分钟来电    : rate(minicpm_calls_total[1m])
+  AI 连接延迟   : histogram_quantile(0.95, minicpm_ai_connect_latency_bucket)
+  音频丢帧率    : rate(minicpm_audio_drop_total[1m])
+  打断次数      : rate(minicpm_barge_in_total[5m])
+"""
+
+import logging
+
+logger = logging.getLogger("Metrics")
+
+try:
+    from prometheus_client import (
+        Counter,
+        Gauge,
+        Histogram,
+        Info,
+        start_http_server as _start_http,
+    )
+    _AVAILABLE = True
+except ImportError:
+    _AVAILABLE = False
+    logger.warning(
+        "prometheus_client not installed, metrics disabled. "
+        "Run: pip install prometheus-client"
+    )
+
+
+class _Noop:
+    """prometheus_client 未安装时的空操作替代，保持调用接口一致。"""
+    def inc(self, *a, **kw):     pass
+    def dec(self, *a, **kw):     pass
+    def set(self, *a, **kw):     pass
+    def observe(self, *a, **kw): pass
+    def info(self, *a, **kw):    pass
+    def labels(self, *a, **kw):  return self
+
+
+_NS = "minicpm"   # Prometheus 指标命名空间
+
+
+class GatewayMetrics:
+    """
+    网关全部监控指标。
+
+    启动时创建一个实例，通过 start_http_server() 暴露。
+    session.py 和 main.py 通过注入的方式使用此实例。
+    """
+
+    def __init__(self):
+        if not _AVAILABLE:
+            self._init_noop()
+            return
+
+        # ── 通话 ────────────────────────────────────────────────────────
+
+        self.active_calls = Gauge(
+            "active_calls",
+            "当前活跃通话数",
+            namespace=_NS,
+        )
+
+        self.calls_total = Counter(
+            "calls_total",
+            "通话总数",
+            ["direction", "result"],
+            namespace=_NS,
+        )
+
+        self.call_duration = Histogram(
+            "call_duration_seconds",
+            "通话时长分布（秒）",
+            buckets=[10, 30, 60, 120, 300, 600, 1800],
+            namespace=_NS,
+        )
+
+        # ── AI ──────────────────────────────────────────────────────────
+
+        self.ai_connect_latency = Histogram(
+            "ai_connect_latency_seconds",
+            "AI 首帧音频延迟（从 connect() 到收到第一帧音频）",
+            buckets=[0.05, 0.1, 0.2, 0.3, 0.5, 0.8, 1.0, 2.0, 5.0],
+            namespace=_NS,
+        )
+
+        self.ai_errors_total = Counter(
+            "ai_errors_total",
+            "AI 连接/协议错误总数",
+            ["reason"],
+            namespace=_NS,
+        )
+
+        # ── 音频 ────────────────────────────────────────────────────────
+
+        self.audio_frames_in = Counter(
+            "audio_frames_in_total",
+            "从 FreeSWITCH 收到的音频帧总数",
+            namespace=_NS,
+        )
+
+        self.audio_frames_out = Counter(
+            "audio_frames_out_total",
+            "发送给 FreeSWITCH 的音频帧总数",
+            namespace=_NS,
+        )
+
+        self.audio_drop_total = Counter(
+            "audio_drop_total",
+            "因队列满丢弃的音频帧数",
+            ["direction"],   # "in" | "out"
+            namespace=_NS,
+        )
+
+        self.barge_in_total = Counter(
+            "barge_in_total",
+            "用户打断 AI 的次数",
+            namespace=_NS,
+        )
+
+        self.transcripts_total = Counter(
+            "transcripts_total",
+            "语音识别完成次数",
+            namespace=_NS,
+        )
+
+        # ── ESL ─────────────────────────────────────────────────────────
+
+        self.esl_connected = Gauge(
+            "esl_connected",
+            "ESL 连接状态（1=已连接，0=断开）",
+            namespace=_NS,
+        )
+
+        self.esl_reconnects_total = Counter(
+            "esl_reconnects_total",
+            "ESL 断线重连次数",
+            namespace=_NS,
+        )
+
+        # ── 系统信息 ────────────────────────────────────────────────────
+
+        self.build_info = Info(
+            "build",
+            "网关版本信息",
+            namespace=_NS,
+        )
+        self.build_info.info({
+            "version":    "3.0",
+            "audio_mode": "mod_audio_stream+fifo_fallback",
+        })
+
+        logger.info("Prometheus metrics initialized")
+
+    def _init_noop(self):
+        _n = _Noop()
+        self.active_calls         = _n
+        self.calls_total          = _n
+        self.call_duration        = _n
+        self.ai_connect_latency   = _n
+        self.ai_errors_total      = _n
+        self.audio_frames_in      = _n
+        self.audio_frames_out     = _n
+        self.audio_drop_total     = _n
+        self.barge_in_total       = _n
+        self.transcripts_total    = _n
+        self.esl_connected        = _n
+        self.esl_reconnects_total = _n
+        self.build_info           = _n
+
+    def start_http_server(self, port: int = 9090):
+        """
+        启动 Prometheus metrics HTTP 服务器。
+        访问 http://host:{port}/metrics 获取指标。
+        """
+        if not _AVAILABLE:
+            return
+        try:
+            _start_http(port)
+            logger.info(f"Prometheus metrics → http://0.0.0.0:{port}/metrics")
+        except OSError as e:
+            logger.error(f"Metrics server failed to start on :{port}: {e}")
+```
+
+---
+
+## `session.py`
+
+```python
+"""
+session.py  ─  通话会话 v3.0
+
+架构：
+  mod_audio_stream 模式（低延迟，默认）：
+    FS <─WebSocket─> AudioStreamHandler <─queue─> AI
+    延迟：50~150ms，无文件 IO
+
+  FIFO 降级模式：
+    FS ─FIFO─> 读取线程 <─queue─> AI ─queue─> 播放线程 ─文件─> FS
+    延迟：200~600ms
+
+修复：
+  [1] dataclass 全部字段加类型注解，消除类变量共享
+  [2] FIFO 模式调用顺序：send_bgapi_nowait → start_fifo → start
+  [3] AudioStreamServer 移除无效 create_connection 参数
+  [4] TCP_NODELAY 在 _on_connect 里连接建立后设置
+  [5] 协程跨线程调用统一用 run_coroutine_threadsafe
+  [6] FIFO 非阻塞打开 + select 超时
+  [7] 协程中阻塞 queue.get 改为 run_in_executor
+  [8] hangup 幂等（_hangup_lock）
+  [9] barge-in 状态门控（_barge_lock + is_ai_speaking）
+  [10] _on_ai_turn_done 用 AudioFrameBuffer.flush() 取剩余数据
+"""
+
+import asyncio
+import json
+import logging
+import os
+import queue
+import select
+import shutil
+import socket as _socket
+import tempfile
+import threading
+import time
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
+
+import websockets
+import websockets.exceptions
+
+from audio import AudioConverter, AudioFrameBuffer, FRAME_PCMA
+from ai_client import AIClient
+
+logger = logging.getLogger("Session")
+
+# ── 批量播放配置（FIFO 降级模式）────────────────────────────────────────
+FLUSH_MIN_MS    = 200
+FLUSH_MIN_BYTES = 8_000 * FLUSH_MIN_MS // 1000    # 1 600 bytes
+FLUSH_MAX_SEC   = 0.4
+FIFO_OPEN_TIMEOUT   = 15.0
+KEEP_AUDIO_FILES    = 20
+
+# ── mod_audio_stream 默认端口 ────────────────────────────────────────────
+STREAM_WS_HOST_DEFAULT = "0.0.0.0"
+STREAM_WS_PORT_DEFAULT = 8081
+
+
+# ======================================================================
+#  AudioStreamHandler：处理单路通话的 WebSocket 连接
+# ======================================================================
+
+class AudioStreamHandler:
+    """
+    处理 FreeSWITCH mod_audio_stream 建立的单路 WebSocket 连接。
+
+    协议：
+      FS → 程序：二进制 PCMA 帧 / JSON 控制消息（start/stop/dtmf）
+      程序 → FS：二进制 PCMA 帧（AI 回复音频）
+    """
+
+    def __init__(self,
+                 session: "CallSession",
+                 ws:      websockets.WebSocketServerProtocol):
+        self._session = session
+        self._ws      = ws
+        self._running = True
+
+    async def run(self):
+        recv_task = asyncio.create_task(self._recv_from_fs())
+        send_task = asyncio.create_task(self._send_to_fs())
+        try:
+            done, pending = await asyncio.wait(
+                {recv_task, send_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for t in pending:
+                t.cancel()
+                try:
+                    await t
+                except asyncio.CancelledError:
+                    pass
+        except Exception as e:
+            logger.error(f"[{self._session.uuid}] AudioStream run error: {e}")
+
+    async def stop(self):
+        self._running = False
+
+    async def _recv_from_fs(self):
+        """接收 FS 推来的音频帧和控制消息。"""
+        try:
+            async for msg in self._ws:
+                if not self._running:
+                    break
+
+                if isinstance(msg, bytes):
+                    if not msg:
+                        continue
+                    self._session.audio_in_bytes += len(msg)
+                    if self._session._metrics:
+                        self._session._metrics.audio_frames_in.inc()
+                    try:
+                        self._session.fs_to_ai_queue.put_nowait(msg)
+                    except queue.Full:
+                        if self._session._metrics:
+                            self._session._metrics.audio_drop_total.labels(
+                                direction="in"
+                            ).inc()
+                        try:
+                            self._session.fs_to_ai_queue.get_nowait()
+                            self._session.fs_to_ai_queue.put_nowait(msg)
+                        except queue.Empty:
+                            pass
+
+                else:
+                    await self._handle_ctrl(msg)
+
+        except websockets.exceptions.ConnectionClosed:
+            pass
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.error(
+                f"[{self._session.uuid}] AudioStream recv error: {e}"
+            )
+
+    async def _handle_ctrl(self, raw: str):
+        """处理 JSON 控制帧。"""
+        try:
+            ctrl  = json.loads(raw)
+            event = ctrl.get("event", "")
+            if event == "start":
+                logger.info(
+                    f"[{self._session.uuid}] AudioStream start: {ctrl}"
+                )
+            elif event == "stop":
+                logger.info(
+                    f"[{self._session.uuid}] AudioStream stop"
+                )
+                self._running = False
+            elif event == "dtmf":
+                digit = ctrl.get("digit", "")
+                if digit:
+                    self._session.on_dtmf(digit)
+        except Exception as e:
+            logger.warning(
+                f"[{self._session.uuid}] ctrl parse error: {e}"
+            )
+
+    async def _send_to_fs(self):
+        """
+        从 ai_to_fs_queue 取 PCMA 帧，直接通过 WebSocket 发给 FS。
+        这是低延迟的关键：无文件 IO，无 uuid_broadcast ESL 往返。
+        """
+        loop = asyncio.get_running_loop()
+        while self._running:
+            try:
+                frame = await loop.run_in_executor(
+                    None,
+                    lambda: self._session.ai_to_fs_queue.get(timeout=0.02),
+                )
+                if frame is None:
+                    break
+                await self._ws.send(frame)
+                self._session.audio_out_bytes += len(frame)
+                if self._session._metrics:
+                    self._session._metrics.audio_frames_out.inc()
+            except queue.Empty:
+                continue
+            except websockets.exceptions.ConnectionClosed:
+                break
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(
+                    f"[{self._session.uuid}] AudioStream send error: {e}"
+                )
+
+
+# ======================================================================
+#  AudioStreamServer：WebSocket 服务器
+# ======================================================================
+
+class AudioStreamServer:
+    """
+    监听 FreeSWITCH mod_audio_stream 的 WebSocket 连接。
+
+    修复：移除无效的 create_connection 参数，改为在 _on_connect 中
+    连接建立后设置 TCP_NODELAY。
+
+    FS Dialplan 配置示例：
+      <action application="audio_stream"
+              data="ws://127.0.0.1:8081/${uuid} 8000 mono"/>
+                                              ↑↑↑↑↑↑
+                                              UUID 作为 path，用于路由到对应 session
+    """
+
+    def __init__(self,
+                 host: str = STREAM_WS_HOST_DEFAULT,
+                 port: int = STREAM_WS_PORT_DEFAULT):
+        self._host    = host
+        self._port    = port
+        self._server  = None
+
+        # call_uuid → CallSession（等待连接）or AudioStreamHandler（已连接）
+        self._registry: Dict[str, Any] = {}
+        self._lock = asyncio.Lock()
+
+    async def start(self):
+        """启动 WebSocket 服务器。"""
+        # 修复：不传 create_connection 参数，websockets.serve 没有此参数
+        self._server = await websockets.serve(
+            self._on_connect,
+            self._host,
+            self._port,
+            compression=None,          # 关闭压缩，降低延迟
+            max_size=1 * 1024 * 1024,  # 1MB 足够
+        )
+        logger.info(
+            f"AudioStreamServer → ws://{self._host}:{self._port}"
+        )
+
+    async def stop(self):
+        """关闭服务器。"""
+        if self._server:
+            self._server.close()
+            await self._server.wait_closed()
+
+    def register(self, call_uuid: str, session: "CallSession"):
+        """CHANNEL_ANSWER 时注册 session，等待 FS 来连接。"""
+        self._registry[call_uuid] = session
+
+    def unregister(self, call_uuid: str):
+        """CHANNEL_HANGUP 时注销。"""
+        self._registry.pop(call_uuid, None)
+
+    async def _on_connect(self,
+                          ws:   websockets.WebSocketServerProtocol,
+                          path: str):
+        """
+        FS 建立 WebSocket 连接时调用。
+        path 格式：/{call_uuid}
+
+        修复：TCP_NODELAY 在这里（连接建立后）设置。
+        """
+        # 设置 TCP_NODELAY（连接建立后）
+        try:
+            transport = ws.transport
+            if transport:
+                sock = transport.get_extra_info("socket")
+                if sock:
+                    sock.setsockopt(
+                        _socket.IPPROTO_TCP,
+                        _socket.TCP_NODELAY,
+                        1,
+                    )
+        except Exception as e:
+            logger.debug(f"AudioStream TCP_NODELAY: {e}")
+
+        call_uuid = path.lstrip("/")
+        if not call_uuid:
+            logger.warning("AudioStream: missing call_uuid in path")
+            await ws.close()
+            return
+
+        session = self._registry.get(call_uuid)
+        if not isinstance(session, CallSession):
+            logger.warning(f"AudioStream: no session for {call_uuid!r}")
+            await ws.close()
+            return
+
+        logger.info(f"[{call_uuid}] AudioStream WebSocket connected")
+
+        handler = AudioStreamHandler(session, ws)
+        session._stream_handler = handler
+        self._registry[call_uuid] = handler   # 替换为 handler
+
+        await handler.run()
+
+        session._stream_handler = None
+        logger.info(f"[{call_uuid}] AudioStream WebSocket disconnected")
+
+
+# ======================================================================
+#  CallSession
+# ======================================================================
+
+@dataclass
+class CallSession:
+    """
+    单路通话完整状态。
+
+    所有字段必须有类型注解，确保 dataclass 正确生成实例变量（非类变量）。
+    """
+
+    # ── 构造时传入 ──────────────────────────────────────────────────────
+    uuid:          str
+    direction:     str
+    caller_number: str
+    callee_number: str
+
+    # ── 时间戳 ──────────────────────────────────────────────────────────
+    created_at: float = field(default_factory=time.time)
+
+    # ── 音频队列 ────────────────────────────────────────────────────────
+    fs_to_ai_queue: queue.Queue = field(
+        default_factory=lambda: queue.Queue(maxsize=500)
+    )
+    ai_to_fs_queue: queue.Queue = field(
+        default_factory=lambda: queue.Queue(maxsize=500)
+    )
+
+    # ── 状态 ────────────────────────────────────────────────────────────
+    is_active:        bool = field(default=True)
+    is_answered:      bool = field(default=False)
+    is_ai_speaking:   bool = field(default=False)
+    use_audio_stream: bool = field(default=True)
+
+    # ── 统计 ────────────────────────────────────────────────────────────
+    audio_in_bytes:  int   = field(default=0)
+    audio_out_bytes: int   = field(default=0)
+    barge_in_count:  int   = field(default=0)
+    ai_latency_ms:   float = field(default=-1.0)
+
+    # ── 内部对象（init=False，不暴露给构造方） ─────────────────────────
+    ai_client:       Optional[AIClient]                  = field(default=None,                      init=False)
+    _loop:           Optional[asyncio.AbstractEventLoop] = field(default=None,                      init=False)
+    _esl_ref:        Any                                 = field(default=None,                      init=False)
+    _threads:        List[threading.Thread]              = field(default_factory=list,               init=False)
+    _fifo_path:      str                                 = field(default="",                        init=False)
+    _tmp_dir:        str                                 = field(default="",                        init=False)
+    _frame_buf:      AudioFrameBuffer                    = field(default_factory=AudioFrameBuffer,  init=False)
+    _hangup_lock:    threading.Lock                      = field(default_factory=threading.Lock,    init=False)
+    _barge_lock:     threading.Lock                      = field(default_factory=threading.Lock,    init=False)
+    _stream_handler: Optional[AudioStreamHandler]        = field(default=None,                      init=False)
+    _metrics:        Optional[Any]                       = field(default=None,                      init=False)
+
+    # ================================================================== #
+    #  生命周期
+    # ================================================================== #
+
+    def start(self,
+              loop:         asyncio.AbstractEventLoop,
+              esl_conn:     Any,
+              metrics:      Optional[Any]                  = None,
+              audio_server: Optional[AudioStreamServer]    = None):
+        """
+        启动会话工作线程和 AI 协程。
+
+        FIFO 模式调用顺序（修复 [2]）：
+          外部调用方应先 send_bgapi_nowait(uuid_record)，
+          再 session.start_fifo()，
+          最后 session.start()。
+          本方法内部不再主动调用 start_fifo，职责分离。
+        """
+        import weakref
+        self._loop    = loop
+        self._esl_ref = weakref.ref(esl_conn)
+        self._metrics = metrics
+
+        if audio_server is not None:
+            self.use_audio_stream = True
+            audio_server.register(self.uuid, self)
+            logger.info(
+                f"[{self.uuid}] Mode: mod_audio_stream"
+            )
+        else:
+            self.use_audio_stream = False
+            self._tmp_dir = tempfile.mkdtemp(
+                prefix=f"ai_{self.uuid[:8]}_"
+            )
+            # FIFO 降级模式：播放线程
+            t_play = threading.Thread(
+                target=self._play_loop_fifo,
+                name=f"play-{self.uuid[:8]}",
+                daemon=True,
+            )
+            t_play.start()
+            self._threads.append(t_play)
+            logger.info(f"[{self.uuid}] Mode: FIFO (fallback)")
+
+        # AI 主协程
+        asyncio.run_coroutine_threadsafe(self._ai_main(), self._loop)
+
+        if self._metrics:
+            self._metrics.active_calls.inc()
+
+    def start_fifo(self):
+        """
+        FIFO 降级模式：启动读取线程。
+        必须在 uuid_record 命令发出之后调用。
+        """
+        t = threading.Thread(
+            target=self._fifo_read_loop,
+            name=f"fifo-{self.uuid[:8]}",
+            daemon=True,
+        )
+        t.start()
+        self._threads.append(t)
+
+    def hangup(self, reason: str = "normal"):
+        """挂断并清理所有资源，幂等。"""
+        with self._hangup_lock:
+            if not self.is_active:
+                return
+            self.is_active = False
+
+        logger.info(f"[{self.uuid}] Hangup: {reason}")
+
+        if self._stream_handler:
+            if self._loop and self._loop.is_running():
+                asyncio.run_coroutine_threadsafe(
+                    self._stream_handler.stop(), self._loop
+                )
+
+        if self.ai_client and self._loop and self._loop.is_running():
+            asyncio.run_coroutine_threadsafe(
+                self.ai_client.close(), self._loop
+            )
+
+        for t in self._threads:
+            t.join(timeout=3)
+
+        if self._fifo_path and os.path.exists(self._fifo_path):
+            try:
+                os.remove(self._fifo_path)
+            except OSError:
+                pass
+
+        if self._tmp_dir and os.path.exists(self._tmp_dir):
+            shutil.rmtree(self._tmp_dir, ignore_errors=True)
+
+        if self._metrics:
+            self._metrics.active_calls.dec()
+            self._metrics.call_duration.observe(
+                time.time() - self.created_at
+            )
+
+        logger.info(
+            f"[{self.uuid}] Cleanup done | "
+            f"in={self.audio_in_bytes}B "
+            f"out={self.audio_out_bytes}B "
+            f"barge_in={self.barge_in_count} "
+            f"ai_latency={self.ai_latency_ms:.0f}ms"
+        )
+
+    # ================================================================== #
+    #  ESL 事件入口（从 ESL 回调线程调用）
+    # ================================================================== #
+
+    def on_answered(self):
+        self.is_answered = True
+
+    def on_dtmf(self, digit: str):
+        logger.info(f"[{self.uuid}] DTMF: {digit!r}")
+        if digit in ("*", "#"):
+            self.barge_in()
+        elif self.ai_client and self._loop:
+            asyncio.run_coroutine_threadsafe(
+                self.ai_client.send_text(f"用户按键：{digit}"),
+                self._loop,
+            )
+
+    def barge_in(self):
+        """打断 AI，状态门控，幂等。"""
+        with self._barge_lock:
+            if not self.is_ai_speaking:
+                return
+            self.is_ai_speaking = False
+
+        self.barge_in_count += 1
+        logger.info(f"[{self.uuid}] Barge-in #{self.barge_in_count}")
+
+        # FIFO 模式需要通知 FS 停止播放
+        # mod_audio_stream 模式清空队列即可，FS 不会继续播放已丢弃的帧
+        if not self.use_audio_stream:
+            esl = self._esl_ref() if self._esl_ref else None
+            if esl:
+                try:
+                    esl.send_bgapi_nowait(
+                        f"uuid_break {self.uuid} all"
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"[{self.uuid}] uuid_break failed: {e}"
+                    )
+
+        if self.ai_client and self._loop:
+            asyncio.run_coroutine_threadsafe(
+                self.ai_client.interrupt(), self._loop
+            )
+
+        self._drain_audio()
+
+        if self._metrics:
+            self._metrics.barge_in_total.inc()
+
+    # ================================================================== #
+    #  FIFO 读取线程
+    # ================================================================== #
+
+    def _fifo_read_loop(self):
+        """
+        以阻塞方式读取 FS 写入 FIFO 的 G.711a 音频。
+        非阻塞打开 + select 超时，防止 FS 未启动时永久挂起。
+        """
+        fd = -1
+        try:
+            fd = os.open(self._fifo_path, os.O_RDONLY | os.O_NONBLOCK)
+            ready, _, _ = select.select([fd], [], [], FIFO_OPEN_TIMEOUT)
+            if not ready:
+                logger.error(
+                    f"[{self.uuid}] FIFO not ready after "
+                    f"{FIFO_OPEN_TIMEOUT}s"
+                )
+                self.hangup("fifo_timeout")
+                return
+
+            os.set_blocking(fd, True)
+            logger.info(f"[{self.uuid}] FIFO read started")
+
+            while self.is_active:
+                try:
+                    data = os.read(fd, FRAME_PCMA)
+                except BlockingIOError:
+                    time.sleep(0.005)
+                    continue
+                if not data:
+                    logger.info(f"[{self.uuid}] FIFO EOF")
+                    break
+
+                self.audio_in_bytes += len(data)
+                if self._metrics:
+                    self._metrics.audio_frames_in.inc()
+
+                try:
+                    self.fs_to_ai_queue.put_nowait(data)
+                except queue.Full:
+                    if self._metrics:
+                        self._metrics.audio_drop_total.labels(
+                            direction="in"
+                        ).inc()
+                    try:
+                        self.fs_to_ai_queue.get_nowait()
+                        self.fs_to_ai_queue.put_nowait(data)
+                    except queue.Empty:
+                        pass
+
+        except Exception as e:
+            if self.is_active:
+                logger.error(f"[{self.uuid}] FIFO error: {e}")
+        finally:
+            if fd >= 0:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            logger.info(f"[{self.uuid}] FIFO read loop exited")
+
+    # ================================================================== #
+    #  AI 主协程
+    # ================================================================== #
+
+    async def _ai_main(self):
+        client = AIClient(self.uuid)
+        client.on_audio_chunk    = self._on_ai_audio
+        client.on_turn_done      = self._on_ai_turn_done
+        client.on_speech_started = self._on_speech_started
+        client.on_transcript     = self._on_transcript
+        client.on_error          = self._on_ai_error
+        client.on_connected      = self._on_ai_connected
+        self.ai_client = client
+
+        if not await client.connect():
+            if self._metrics:
+                self._metrics.ai_errors_total.labels(
+                    reason="connect_failed"
+                ).inc()
+            self.hangup("ai_connect_failed")
+            return
+
+        if self.direction == "outbound":
+            await client.send_text(
+                "你好，我是智能客服，请问有什么可以帮您？"
+            )
+
+        await self._send_to_ai_loop()
+
+    async def _send_to_ai_loop(self):
+        """
+        持续从 fs_to_ai_queue 读取 PCMA 帧，转换后发给 AI。
+        用 run_in_executor 包装阻塞的 queue.get，不阻塞事件循环。
+        """
+        loop      = asyncio.get_running_loop()
+        converter = AudioConverter()
+
+        while self.is_active and self.ai_client and self.ai_client.connected:
+            try:
+                pcma = await loop.run_in_executor(
+                    None,
+                    lambda: self.fs_to_ai_queue.get(timeout=0.05),
+                )
+            except queue.Empty:
+                continue
+            except Exception as e:
+                logger.error(f"[{self.uuid}] queue read error: {e}")
+                break
+
+            try:
+                pcm16 = converter.fs_to_ai(pcma)
+                await self.ai_client.send_audio(pcm16)
+            except Exception as e:
+                logger.error(f"[{self.uuid}] AI send error: {e}")
+                break
+
+    # ================================================================== #
+    #  AI 回调（事件循环线程，必须快速返回）
+    # ================================================================== #
+
+    def _on_ai_connected(self):
+        if self.ai_client:
+            self.ai_latency_ms = self.ai_client.latency_connect_ms
+        if self._metrics and self.ai_latency_ms > 0:
+            self._metrics.ai_connect_latency.observe(
+                self.ai_latency_ms / 1000.0
+            )
+
+    def _on_ai_audio(self, pcm16_bytes: bytes):
+        """AI 产生音频块 → 帧缓冲区 → ai_to_fs_queue。"""
+        self.is_ai_speaking = True
+        self._frame_buf.push_pcm16(pcm16_bytes)
+
+        for frame in self._frame_buf.pop_frames():
+            try:
+                self.ai_to_fs_queue.put_nowait(frame)
+            except queue.Full:
+                if self._metrics:
+                    self._metrics.audio_drop_total.labels(
+                        direction="out"
+                    ).inc()
+                try:
+                    self.ai_to_fs_queue.get_nowait()
+                    self.ai_to_fs_queue.put_nowait(frame)
+                except queue.Empty:
+                    pass
+
+    def _on_ai_turn_done(self):
+        """本轮结束，flush 帧缓冲区剩余数据（修复 [10]：用公开方法）。"""
+        tail = self._frame_buf.flush()
+        if tail:
+            try:
+                self.ai_to_fs_queue.put_nowait(tail)
+            except queue.Full:
+                pass
+        logger.debug(f"[{self.uuid}] AI turn done")
+
+    def _on_speech_started(self):
+        if self.is_ai_speaking:
+            self.barge_in()
+
+    def _on_transcript(self, text: str):
+        logger.info(f"[{self.uuid}] User: {text}")
+        if self._metrics:
+            self._metrics.transcripts_total.inc()
+
+    def _on_ai_error(self, reason: str):
+        logger.error(f"[{self.uuid}] AI error: {reason!r}")
+        if self._metrics:
+            self._metrics.ai_errors_total.labels(reason=reason).inc()
+        if self.is_active:
+            self.hangup(f"ai_error:{reason}")
+
+    # ================================================================== #
+    #  FIFO 降级模式：播放线程
+    # ================================================================== #
+
+    def _play_loop_fifo(self):
+        """
+        累积 AI 音频帧，批量写文件 + uuid_broadcast 播放。
+        减少 ESL 调用频率，降低系统负载。
+        """
+        buf        = bytearray()
+        last_data  = time.monotonic()
+        last_flush = time.monotonic()
+
+        while self.is_active:
+            try:
+                frame = self.ai_to_fs_queue.get(timeout=0.02)
+                buf.extend(frame)
+                last_data = time.monotonic()
+            except queue.Empty:
+                pass
+
+            now         = time.monotonic()
+            queue_empty = self.ai_to_fs_queue.empty()
+            should_flush = (
+                len(buf) >= FLUSH_MIN_BYTES
+                or (buf and queue_empty and now - last_data  >= 0.08)
+                or (buf and now - last_flush >= FLUSH_MAX_SEC)
+            )
+
+            if should_flush and buf:
+                self._flush_to_fs(bytes(buf))
+                buf.clear()
+                last_flush = now
+                if queue_empty:
+                    self.is_ai_speaking = False
+
+        if buf:
+            self._flush_to_fs(bytes(buf))
+        logger.info(f"[{self.uuid}] Play loop exited")
+
+    def _flush_to_fs(self, pcma_data: bytes):
+        """写临时文件并通过 uuid_broadcast 播放。"""
+        esl = self._esl_ref() if self._esl_ref else None
+        if not esl or not self._tmp_dir:
+            return
+
+        fname = os.path.join(
+            self._tmp_dir,
+            f"{int(time.monotonic() * 1_000_000)}.pcma",
+        )
+        try:
+            with open(fname, "wb") as f:
+                f.write(pcma_data)
+            esl.send_bgapi_nowait(
+                f"uuid_broadcast {self.uuid} {fname} aleg"
+            )
+            if self._metrics:
+                self._metrics.audio_frames_out.inc()
+        except Exception as e:
+            logger.error(f"[{self.uuid}] flush_to_fs error: {e}")
+            return
+
+        self._cleanup_old_files()
+
+    def _cleanup_old_files(self):
+        if not self._tmp_dir or not os.path.exists(self._tmp_dir):
+            return
+        try:
+            files = sorted(
+                (f for f in os.listdir(self._tmp_dir)
+                 if f.endswith(".pcma")),
+                key=lambda f: os.path.getmtime(
+                    os.path.join(self._tmp_dir, f)
+                ),
+            )
+            for old in files[:-KEEP_AUDIO_FILES]:
+                try:
+                    os.remove(os.path.join(self._tmp_dir, old))
+                except OSError:
+                    pass
+        except Exception:
+            pass
+
+    # ================================================================== #
+    #  工具
+    # ================================================================== #
+
+    def _drain_audio(self):
+        """清空音频队列和帧缓冲区（barge-in 时调用）。"""
+        for q in (self.ai_to_fs_queue, self.fs_to_ai_queue):
+            while not q.empty():
+                try:
+                    q.get_nowait()
+                except queue.Empty:
+                    break
+        self._frame_buf.clear()
+
+    def to_dict(self) -> dict:
+        """序列化为 API 响应格式。"""
+        return {
+            "uuid":             self.uuid,
+            "direction":        self.direction,
+            "caller":           self.caller_number,
+            "callee":           self.callee_number,
+            "is_active":        self.is_active,
+            "is_answered":      self.is_answered,
+            "is_ai_speaking":   self.is_ai_speaking,
+            "ai_connected":     (
+                self.ai_client.connected if self.ai_client else False
+            ),
+            "audio_mode":       (
+                "stream" if self.use_audio_stream else "fifo"
+            ),
+            "audio_in_bytes":   self.audio_in_bytes,
+            "audio_out_bytes":  self.audio_out_bytes,
+            "barge_in_count":   self.barge_in_count,
+            "ai_latency_ms":    round(self.ai_latency_ms, 1),
+            "duration_sec":     round(time.time() - self.created_at, 1),
+        }
+```
+
+---
+
+## `api.py`
+
+```python
+"""
+api.py  ─  FastAPI HTTP 路由 v3.0
+"""
+
+import asyncio
+import logging
+import time
+import uuid as uuid_mod
+from typing import Optional
+
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
+
+import config
+
+logger  = logging.getLogger("API")
+api_app = FastAPI(title="MiniCPM-o Gateway", version="3.0")
+
+_mgr     = None
+_esl     = None
+_loop:   Optional[asyncio.AbstractEventLoop] = None
+_metrics = None
+
+
+def init(session_mgr, esl_conn, loop, metrics=None):
+    global _mgr, _esl, _loop, _metrics
+    _mgr     = session_mgr
+    _esl     = esl_conn
+    _loop    = loop
+    _metrics = metrics
+
+
+# ── 全局异常处理 ────────────────────────────────────────────────────────
+
+@api_app.exception_handler(Exception)
+async def _global_exc(request: Request, exc: Exception):
+    logger.exception(f"Unhandled API error: {exc}")
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal server error"},
+    )
+
+
+# ── 路由 ────────────────────────────────────────────────────────────────
+
+@api_app.get("/")
+async def root():
+    return {
+        "service": "MiniCPM-o Gateway",
+        "version": "3.0",
+        "ai_mode": config.AI_MODE,
+    }
+
+
+@api_app.get("/health")
+async def health():
+    return {
+        "esl_connected":   _esl.connected if _esl else False,
+        "active_sessions": len(_mgr.sessions) if _mgr else 0,
+        "ai_mode":         config.AI_MODE,
+        "audio_mode":      (
+            "mod_audio_stream"
+            if getattr(config, "USE_AUDIO_STREAM", True)
+            else "fifo"
+        ),
+    }
+
+
+@api_app.get("/sessions")
+async def list_sessions():
+    if not _mgr:
+        return {"count": 0, "sessions": []}
+    return {
+        "count":    len(_mgr.sessions),
+        "sessions": _mgr.list_active(),
+    }
+
+
+@api_app.get("/sessions/{call_uuid}")
+async def get_session(call_uuid: str):
+    if not _mgr:
+        raise HTTPException(status_code=503, detail="Not initialized")
+    s = _mgr.get(call_uuid)
+    if not s:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return s.to_dict()
+
+
+@api_app.post("/call")
+async def make_call(request: dict):
+    phone = str(request.get("phone_number", "")).strip()
+    if not phone:
+        raise HTTPException(status_code=400, detail="phone_number required")
+
+    gateway   = request.get("gateway",   config.FXO_GATEWAY)
+    caller_id = request.get("caller_id", config.OUTBOUND_CID)
+    call_uuid = str(uuid_mod.uuid4())
+
+    cmd = (
+        f"originate {{"
+        f"origination_uuid={call_uuid},"
+        f"origination_caller_id_number={caller_id},"
+        f"origination_caller_id_name=AI,"
+        f"ignore_early_media=true"
+        f"}} sofia/gateway/{gateway}/{phone} &park"
+    )
+
+    try:
+        # 在线程池中执行阻塞的 send_command，不阻塞事件循环
+        result = await asyncio.get_running_loop().run_in_executor(
+            None, _esl.send_command, cmd
+        )
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"ESL error: {e}")
+
+    return {
+        "status":       "initiated",
+        "call_uuid":    call_uuid,
+        "phone_number": phone,
+        "fs_result":    result,
+    }
+
+
+@api_app.post("/call/{call_uuid}/hangup")
+async def hangup_call(call_uuid: str):
+    if not _esl:
+        raise HTTPException(status_code=503, detail="Not initialized")
+    try:
+        _esl.send_bgapi_nowait(f"uuid_kill {call_uuid}")
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"ESL error: {e}")
+    return {"status": "hangup_sent"}
+
+
+@api_app.post("/call/{call_uuid}/barge_in")
+async def barge_in(call_uuid: str):
+    s = _mgr.get(call_uuid) if _mgr else None
+    if not s:
+        raise HTTPException(status_code=404, detail="Session not found")
+    s.barge_in()
+    return {"status": "barge_in_triggered"}
+
+
+@api_app.post("/call/{call_uuid}/say")
+async def say_text(call_uuid: str, request: dict):
+    """向指定通话注入文本，驱动 AI 说出来。"""
+    s = _mgr.get(call_uuid) if _mgr else None
+    if not s:
+        raise HTTPException(status_code=404, detail="Session not found")
+    text = str(request.get("text", "")).strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="text required")
+    if s.ai_client and _loop:
+        asyncio.run_coroutine_threadsafe(
+            s.ai_client.send_text(text), _loop
+        )
+    return {"status": "sent"}
+```
+
+---
+
+## `main.py`
+
+```python
+"""
+main.py  ─  网关入口 v3.0
+
+修复：
+  [1] 使用标准 FastAPI lifespan，不猴子补丁 uvicorn
+  [2] asyncio.get_running_loop() 获取真正运行的 loop
+  [3] FIFO 模式调用顺序：send_bgapi_nowait → start_fifo → start
+  [4] 启动时清理上次异常退出留下的临时文件
+  [5] ESL 断线重连后 metrics 状态更新
+"""
+
+import asyncio
+import glob
+import logging
+import os
+import shutil
+import threading
+import time
+from contextlib import asynccontextmanager
+from typing import Dict, List, Optional
+
+import uvicorn
+
+import config
+from audio_utils import log_audio_backend
+from esl import ESLConnection
+from session import CallSession, AudioStreamServer
+from metrics import GatewayMetrics
+from api import api_app, init as api_init
+
+logger = logging.getLogger("Main")
+
+ALLOWED_CONTEXTS = frozenset({"public", "default"})
+
+
+# ======================================================================
+#  启动时清理
+# ======================================================================
+
+def cleanup_stale_files():
+    """清理上次异常退出遗留的临时文件，防止 /tmp 被撑满。"""
+    count = 0
+    for f in glob.glob("/tmp/minicpm_*.pcma"):
+        try:
+            os.remove(f)
+            count += 1
+        except OSError:
+            pass
+    for d in glob.glob("/tmp/ai_*_*/"):
+        try:
+            shutil.rmtree(d)
+            count += 1
+        except OSError:
+            pass
+    if count:
+        logger.info(f"Cleaned up {count} stale temp files/dirs")
+
+
+# ======================================================================
+#  会话管理器
+# ======================================================================
+
+class SessionManager:
+    def __init__(self):
+        self.sessions: Dict[str, CallSession] = {}
+        self._lock = threading.RLock()
+
+    def create(self, uuid: str, direction: str,
+               caller: str, callee: str) -> CallSession:
+        with self._lock:
+            if uuid in self.sessions:
+                return self.sessions[uuid]
+            s = CallSession(
+                uuid=uuid,
+                direction=direction,
+                caller_number=caller,
+                callee_number=callee,
+            )
+            self.sessions[uuid] = s
+            return s
+
+    def get(self, uuid: str) -> Optional[CallSession]:
+        with self._lock:
+            return self.sessions.get(uuid)
+
+    def remove(self, uuid: str):
+        with self._lock:
+            self.sessions.pop(uuid, None)
+
+    def list_active(self) -> List[dict]:
+        with self._lock:
+            return [s.to_dict() for s in self.sessions.values()]
+
+
+# ======================================================================
+#  ESL 事件处理
+# ======================================================================
+
+class GatewayEventHandler:
+    def __init__(self,
+                 mgr:          SessionManager,
+                 esl:          ESLConnection,
+                 loop:         asyncio.AbstractEventLoop,
+                 metrics:      GatewayMetrics,
+                 audio_server: Optional[AudioStreamServer]):
+        self._mgr          = mgr
+        self._esl          = esl
+        self._loop         = loop
+        self._metrics      = metrics
+        self._audio_server = audio_server
+
+    def on_channel_create(self, event: dict):
+        h         = event["headers"]
+        call_uuid = h.get("Unique-ID", "")
+        direction = h.get("Call-Direction", "unknown")
+        caller    = h.get("Caller-Caller-ID-Number", "unknown")
+        callee    = h.get("Caller-Destination-Number", "unknown")
+        context   = h.get("Caller-Context", "")
+
+        if context not in ALLOWED_CONTEXTS:
+            logger.debug(f"Ignoring channel context={context!r}")
+            return
+
+        self._mgr.create(call_uuid, direction, caller, callee)
+        logger.info(
+            f"[ESL] CREATE {call_uuid} "
+            f"({direction}) {caller} -> {callee}"
+        )
+
+    def on_channel_answer(self, event: dict):
+        h         = event["headers"]
+        call_uuid = h.get("Unique-ID", "")
+        session   = self._mgr.get(call_uuid)
+        if not session:
+            return
+
+        session.on_answered()
+
+        if self._audio_server is not None:
+            # mod_audio_stream 模式
+            # FS Dialplan 负责建立 WebSocket 连接，此处只需注册 session
+            session.start(
+                loop=self._loop,
+                esl_conn=self._esl,
+                metrics=self._metrics,
+                audio_server=self._audio_server,
+            )
+
+        else:
+            # FIFO 降级模式
+            # 修复 [3]：正确调用顺序
+            fifo_path = f"/tmp/minicpm_{call_uuid}.pcma"
+            try:
+                os.mkfifo(fifo_path)
+            except FileExistsError:
+                pass
+            except OSError as e:
+                logger.error(f"[{call_uuid}] mkfifo failed: {e}")
+                return
+
+            session._fifo_path = fifo_path
+
+            # 步骤 1：通知 FS 开始写入 FIFO
+            try:
+                self._esl.send_bgapi_nowait(
+                    f"uuid_record {call_uuid} start {fifo_path} 1800"
+                )
+            except Exception as e:
+                logger.error(f"[{call_uuid}] uuid_record failed: {e}")
+                return
+
+            # 步骤 2：启动 FIFO 读取线程（阻塞等待 FS 写入）
+            session.start_fifo()
+
+            # 步骤 3：启动 AI 协程和播放线程
+            session.start(
+                loop=self._loop,
+                esl_conn=self._esl,
+                metrics=self._metrics,
+                audio_server=None,
+            )
+
+        self._metrics.calls_total.labels(
+            direction=session.direction, result="started"
+        ).inc()
+        logger.info(f"[ESL] ANSWER {call_uuid}")
+
+    def on_channel_hangup(self, event: dict):
+        h         = event["headers"]
+        call_uuid = h.get("Unique-ID", "")
+        cause     = h.get("Hangup-Cause", "UNKNOWN")
+        session   = self._mgr.get(call_uuid)
+
+        if session:
+            if self._audio_server:
+                self._audio_server.unregister(call_uuid)
+            session.hangup(cause)
+            self._mgr.remove(call_uuid)
+            self._metrics.calls_total.labels(
+                direction=session.direction, result="ended"
+            ).inc()
+
+        logger.info(f"[ESL] HANGUP {call_uuid} cause={cause}")
+
+    def on_dtmf(self, event: dict):
+        h         = event["headers"]
+        call_uuid = h.get("Unique-ID", "")
+        digit     = h.get("DTMF-Digit", "")
+        session   = self._mgr.get(call_uuid)
+        if session and digit:
+            session.on_dtmf(digit)
+
+
+# ======================================================================
+#  应用启动（标准 lifespan，无猴子补丁）
+# ======================================================================
+
+def build_app():
+    """构建带 lifespan 的 FastAPI 应用。"""
+
+    @asynccontextmanager
+    async def lifespan(app):
+        # ── 获取真正运行中的事件循环 ────────────────────────────────────
+        loop = asyncio.get_running_loop()
+
+        logging.basicConfig(
+            level=getattr(logging, config.LOG_LEVEL, logging.INFO),
+            format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+            datefmt="%H:%M:%S",
+        )
+
+        # 清理遗留临时文件
+        cleanup_stale_files()
+
+        # 打印音频后端信息
+        log_audio_backend()
+
+        # Prometheus 监控
+        metrics = GatewayMetrics()
+        metrics.start_http_server(
+            getattr(config, "METRICS_PORT", 9090)
+        )
+
+        # AudioStreamServer
+        use_stream   = getattr(config, "USE_AUDIO_STREAM", True)
+        audio_server: Optional[AudioStreamServer] = None
+        if use_stream:
+            audio_server = AudioStreamServer(
+                host=getattr(config, "STREAM_WS_HOST", "0.0.0.0"),
+                port=getattr(config, "STREAM_WS_PORT", 8081),
+            )
+            await audio_server.start()
+
+        # ESL 连接
+        esl = ESLConnection(
+            config.FS_HOST,
+            config.FS_ESL_PORT,
+            config.FS_ESL_PASS,
+        )
+        if not esl.connect():
+            logger.critical("Cannot connect to FreeSWITCH ESL")
+            raise RuntimeError("ESL connection failed")
+
+        metrics.esl_connected.set(1)
+
+        # 会话管理器和事件处理器
+        mgr     = SessionManager()
+        handler = GatewayEventHandler(
+            mgr, esl, loop, metrics, audio_server
+        )
+
+        # 注册事件回调
+        esl.on("CHANNEL_CREATE",  handler.on_channel_create)
+        esl.on("CHANNEL_ANSWER",  handler.on_channel_answer)
+        esl.on("CHANNEL_HANGUP",  handler.on_channel_hangup)
+        esl.on("DTMF",            handler.on_dtmf)
+
+        # 订阅事件（等待 command/reply 确认）
+        esl.subscribe(
+            "CHANNEL_CREATE",
+            "CHANNEL_ANSWER",
+            "CHANNEL_HANGUP",
+            "DTMF",
+            "BACKGROUND_JOB",
+        )
+
+        # 启动 ESL 后台读取线程
+        esl.start()
+
+        # 注入 API 依赖
+        api_init(mgr, esl, loop, metrics)
+
+        logger.info("=" * 54)
+        logger.info("  MiniCPM-o Gateway v3.0  ready")
+        logger.info(f"  AI      : {config.AI_MODE} @ {config.MINICPM_WS_URL}")
+        logger.info(f"  ESL     : {config.FS_HOST}:{config.FS_ESL_PORT}")
+        logger.info(f"  API     : http://0.0.0.0:{config.API_PORT}")
+        logger.info(f"  Mode    : {'mod_audio_stream' if use_stream else 'FIFO'}")
+        if use_stream:
+            logger.info(
+                f"  Stream  : ws://0.0.0.0:"
+                f"{getattr(config, 'STREAM_WS_PORT', 8081)}"
+            )
+        logger.info(
+            f"  Metrics : http://0.0.0.0:"
+            f"{getattr(config, 'METRICS_PORT', 9090)}/metrics"
+        )
+        logger.info("=" * 54)
+
+        yield   # ← 应用运行期间在此等待
+
+        # ── 关闭阶段 ────────────────────────────────────────────────────
+        logger.info("Shutting down...")
+
+        # 挂断所有活跃通话
+        with mgr._lock:
+            sessions = list(mgr.sessions.values())
+        for s in sessions:
+            s.hangup("server_shutdown")
+
+        # 关闭 AudioStreamServer
+        if audio_server:
+            await audio_server.stop()
+
+        # 关闭 ESL
+        esl.stop()
+        metrics.esl_connected.set(0)
+
+        logger.info("Shutdown complete")
+
+    api_app.router.lifespan_context = lifespan
+    return api_app
+
+
+def main():
+    app = build_app()
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=getattr(config, "API_PORT", 8080),
+        log_level="warning",
+    )
+
+
+if __name__ == "__main__":
+    main()
+```
+
+---
+
+## `requirements.txt`
+
+```text
+# Web 框架
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+
+# WebSocket
+websockets>=12.0
+
+# 数值计算
+numpy>=1.26.0
+
+# 高质量重采样（强烈推荐）
+soxr>=0.3.7
+
+# Prometheus 监控
+prometheus-client>=0.20.0
+
+# G.711a 编解码
+# Python <= 3.12：audioop 内置，无需安装
+# Python >= 3.13：取消下面这行的注释
+# audioop-lts>=0.2.1
+```
+
+---
+
+## FreeSWITCH 配置
+
+### `dialplan/default/minicpm_ai.xml`
+
+```xml
+<include>
+  <extension name="minicpm_ai_inbound">
+    <!-- 匹配呼入号码，按需修改 -->
+    <condition field="destination_number" expression="^(5000|5001|5002)$">
+
+      <action application="answer"/>
+      <!-- 等待线路稳定 -->
+      <action application="sleep" data="300"/>
+
+      <!-- mod_audio_stream 模式：将通话音频双向流式传输到网关 -->
+      <!-- ${uuid} 会展开为本次通话的唯一 ID，网关用它路由到对应 session -->
+      <action application="audio_stream"
+              data="ws://127.0.0.1:8081/${uuid} 8000 mono"/>
+
+      <action application="hangup"/>
+    </condition>
+  </extension>
+
+  <!-- 外呼接听后进入 AI 处理 -->
+  <extension name="minicpm_ai_outbound_answer">
+    <condition field="call_direction" expression="outbound">
+      <condition field="answer_state" expression="answered">
+        <action application="audio_stream"
+                data="ws://127.0.0.1:8081/${uuid} 8000 mono"/>
+      </condition>
+    </condition>
+  </extension>
+</include>
+```
+
+### `autoload_configs/modules.conf.xml`（确认加载）
+
+```xml
+<!-- 确保以下模块已启用 -->
+<load module="mod_audio_stream"/>
+<load module="mod_esl"/>
+<load module="mod_sofia"/>
+<load module="mod_g711"/>
+```
+
+---
+
+## 项目结构与启动
+
+```
+minicpm_gateway/
+├── config.py          # 配置
+├── audio_utils.py     # G.711a 编解码 + 重采样
+├── audio.py           # 格式转换 + 帧缓冲
+├── esl.py             # ESL 连接（单读取线程）
+├── ai_client.py       # AI WebSocket 客户端
+├── session.py         # 通话会话状态机
+├── metrics.py         # Prometheus 监控
+├── api.py             # FastAPI 路由
+├── main.py            # 入口
+└── requirements.txt
+```
+
+```bash
+# 安装依赖
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+
+# Python 3.13+ 额外安装
+pip install audioop-lts
+
+# 验证音频后端
+python -c "from audio_utils import log_audio_backend; log_audio_backend()"
+
+# 启动
+python main.py
+```
