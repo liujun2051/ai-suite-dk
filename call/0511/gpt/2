@@ -1,0 +1,428 @@
+有，而且在“真实环境投入运行”之前，还有几项非常关键。
+
+你现在已经不是“代码能不能跑”的阶段了，而是：
+“会不会在真实电话环境里翻车”。
+
+下面这些是上线前必须检查的。
+
+优先级我按：
+P0（必须）
+P1（强烈建议）
+P2（优化）
+来分。
+
+━━━━━━━━━━━━━━━━━━━
+P0 — 必须修/确认
+━━━━━━━━━━━━━━━━━━━
+
+1. mod_audio_stream 的音频格式确认（非常重要）
+
+你现在假设：
+
+```python
+receive_bytes() -> pcm16 8k mono
+```
+
+但实际：
+mod_audio_stream 配置可能输出：
+
+- 16k
+- float32
+- opus
+- stereo
+
+必须确认。
+
+否则：
+会出现：
+- 金属音
+- 语速异常
+- 爆音
+- AI 识别错误
+
+你需要明确：
+
+```xml
+<action application="audio_stream"
+data="wss://xxx/media mono 8k"/>
+```
+
+或者：
+
+```xml
+mono 16k
+```
+
+并和 Python 完全一致。
+
+━━━━━━━━━━━━━━━━━━━
+
+2. OpenAI Realtime API 限速（非常重要）
+
+真实电话里：
+Realtime API 有速率限制。
+
+尤其：
+- append 频率
+- response.create
+- 并发 websocket
+
+你现在：
+每 20ms append。
+
+这已经接近高频。
+
+建议：
+
+改成：
+40ms 或 60ms chunk。
+
+电话里：
+20ms 没明显收益。
+
+推荐：
+
+```python
+FRAME_MS = 40
+```
+
+可以显著降低：
+- websocket 压力
+- token 压力
+- CPU
+
+━━━━━━━━━━━━━━━━━━━
+
+3. 必须加 websocket reconnect
+
+现在 AI websocket 断掉：
+
+整个 session 就废了。
+
+真实环境一定会发生：
+- 网络抖动
+- upstream reset
+- timeout
+
+必须：
+
+```python
+reconnect with backoff
+```
+
+否则：
+夜里会随机死。
+
+━━━━━━━━━━━━━━━━━━━
+
+4. 必须增加 idle timeout
+
+真实电话里：
+有人接通后不说话。
+
+session 会永久占资源。
+
+必须：
+
+```python
+if no_audio > 5min:
+    hangup
+```
+
+━━━━━━━━━━━━━━━━━━━
+
+5. 必须限制最大 session 数
+
+否则：
+AI API 爆掉时，
+FreeSWITCH 还能继续进呼。
+
+结果：
+机器被拖死。
+
+至少：
+
+```python
+MAX_SESSIONS = 50
+```
+
+超过：
+直接拒绝。
+
+━━━━━━━━━━━━━━━━━━━
+
+6. 必须处理 AI 没回复的情况
+
+真实里：
+LLM 可能：
+- 卡住
+- 不说话
+- response 不结束
+
+你需要：
+
+```python
+AI_RESPONSE_TIMEOUT = 20s
+```
+
+否则：
+用户会一直沉默。
+
+━━━━━━━━━━━━━━━━━━━
+
+7. 必须做 audio backpressure
+
+当前：
+
+```python
+await websocket.send_bytes()
+```
+
+如果 FreeSWITCH 读慢：
+Python 会堆积。
+
+必须：
+队列限制。
+
+否则：
+延迟越来越大。
+
+生产语音系统里：
+
+“宁可丢一点音频，
+不要累计 10 秒延迟。”
+
+━━━━━━━━━━━━━━━━━━━
+P1 — 强烈建议
+━━━━━━━━━━━━━━━━━━━
+
+8. 增加 Prometheus metrics
+
+至少：
+
+```text
+active_calls
+ai_ws_connected
+audio_rx_bytes
+audio_tx_bytes
+barge_in_total
+avg_ai_latency_ms
+```
+
+否则：
+出了问题完全没观测。
+
+━━━━━━━━━━━━━━━━━━━
+
+9. 增加 structured logging
+
+不要：
+
+```python
+logger.info("xxx")
+```
+
+而要：
+
+```python
+logger.info(json.dumps({...}))
+```
+
+真实环境排查问题差别巨大。
+
+━━━━━━━━━━━━━━━━━━━
+
+10. FreeSWITCH playback echo
+
+你必须确认：
+
+AI 播放音频不会再被录回 AI。
+
+否则：
+AI 会和自己聊天。
+
+这是电话 AI 最经典事故之一。
+
+必须测试：
+- headset
+- speakerphone
+- noisy line
+
+━━━━━━━━━━━━━━━━━━━
+
+11. 必须测试 barge-in race
+
+用户连续插话：
+
+```text
+AI: 您好请问—
+用户: 喂！
+AI: 您—
+用户: 我说—
+```
+
+很容易：
+多个 interrupt 并发。
+
+必须加：
+
+```python
+interrupt_lock
+```
+
+否则 AI 状态会乱。
+
+━━━━━━━━━━━━━━━━━━━
+
+12. session cleanup
+
+真实里：
+- websocket close
+- fs hangup
+- ai timeout
+
+都可能同时触发。
+
+必须保证：
+
+```python
+close() 幂等
+```
+
+否则：
+会 double close。
+
+━━━━━━━━━━━━━━━━━━━
+P2 — 性能优化
+━━━━━━━━━━━━━━━━━━━
+
+13. resample 性能
+
+你现在 numpy interp。
+
+100路时：
+CPU 会明显高。
+
+推荐：
+
+- soxr
+- speexdsp
+- samplerate
+
+━━━━━━━━━━━━━━━━━━━
+
+14. uvloop
+
+Linux 下建议：
+
+```python
+import uvloop
+asyncio.set_event_loop_policy(
+    uvloop.EventLoopPolicy()
+)
+```
+
+asyncio 性能会提升明显。
+
+━━━━━━━━━━━━━━━━━━━
+
+15. websocket compression 关闭
+
+音频流不适合压缩。
+
+建议：
+
+```python
+compression=None
+```
+
+降低 CPU。
+
+━━━━━━━━━━━━━━━━━━━
+
+16. AI speaking 状态机
+
+现在：
+
+```python
+is_ai_speaking = True/False
+```
+
+太简单。
+
+真实建议：
+
+```python
+IDLE
+LISTENING
+THINKING
+SPEAKING
+INTERRUPTING
+CLOSING
+```
+
+否则复杂场景会乱。
+
+━━━━━━━━━━━━━━━━━━━
+真正上线前的测试清单
+━━━━━━━━━━━━━━━━━━━
+
+必须做：
+
+✅ 连续通话 24 小时
+✅ 50+ 次连续 barge-in
+✅ AI websocket 中断恢复
+✅ FreeSWITCH restart
+✅ 网络抖动
+✅ 用户静音 10 分钟
+✅ 同时 10 路通话
+✅ 中文长句
+✅ 快速抢话
+✅ DTMF 中断
+✅ 挂机 race
+
+━━━━━━━━━━━━━━━━━━━
+最后一个非常重要的现实问题
+━━━━━━━━━━━━━━━━━━━
+
+OpenAI Realtime API：
+目前并不是“电信级 SLA”。
+
+真实商用时：
+你必须接受：
+
+- 偶发 timeout
+- latency spike
+- reconnect
+- upstream jitter
+
+所以：
+你的系统设计必须：
+
+“默认上游会偶尔出问题”。
+
+━━━━━━━━━━━━━━━━━━━
+结论
+━━━━━━━━━━━━━━━━━━━
+
+你现在已经：
+
+不是 demo。
+
+而是：
+“真正可上线的语音 AI 网关雏形”。
+
+但上线前，
+至少还要完成：
+
+必须：
+✅ reconnect
+✅ timeout
+✅ backpressure
+✅ max sessions
+✅ interrupt lock
+✅ echo 测试
+✅ metrics
+
+做完这些，
+就已经是相当专业的系统了。
