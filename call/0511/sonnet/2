@@ -1,0 +1,343 @@
+# 投入生产前的最终检查
+
+代码逻辑基本完整，但有几个**会直接导致生产环境失败**的问题需要在部署前解决。
+
+---
+
+## 🔴 必须修复（会导致崩溃/不可用）
+
+### 1. `ai_client.py` — `_make_socket` 与 `websockets.connect` 冲突
+
+```python
+# 现在的代码：
+self._ws = await websockets.connect(
+    config.MINICPM_WS_URL,
+    extra_headers=extra_headers,
+    sock=await self._make_socket(),   # ❌ 问题在这里
+)
+
+# _make_socket 里手动 connect 了 TCP，
+# 但 websockets.connect 拿到 sock 参数后会假设 sock 已连接，
+# 同时它自己还会再做一次 TLS/WS 握手。
+# 对于 ws:// 没有 TLS 时勉强能工作，
+# 对于 wss:// 会直接崩溃，因为 TLS 上下文没有正确传递。
+```
+
+```python
+# 正确做法：不要自己建 socket，让 websockets 建连后设置选项
+# websockets >= 12.0 支持 open_timeout 和 additional_headers
+
+async def connect(self) -> bool:
+    extra_headers = {}
+    if self.mode == "cloud":
+        extra_headers["Authorization"] = f"Bearer {config.CLOUD_API_KEY}"
+    try:
+        self._ws = await asyncio.wait_for(
+            websockets.connect(
+                config.MINICPM_WS_URL,
+                extra_headers=extra_headers,
+                ping_interval=20,
+                ping_timeout=10,
+                max_size=16 * 1024 * 1024,
+                # ✅ 通过 create_connection 参数设置 TCP_NODELAY
+                create_connection=_make_nodelay_connection,
+            ),
+            timeout=self._CONNECT_TIMEOUT,
+        )
+        ...
+
+# 模块级别的工厂函数（不是 _make_socket 那种方式）
+async def _make_nodelay_connection(uri, **kwargs):
+    """创建禁用 Nagle 算法的 WebSocket 连接。"""
+    import socket as _socket
+    ws = await websockets.connect(uri, **kwargs)
+    # 连接建立后设置 socket 选项
+    transport = ws.transport
+    if transport:
+        sock = transport.get_extra_info("socket")
+        if sock:
+            sock.setsockopt(_socket.IPPROTO_TCP, _socket.TCP_NODELAY, 1)
+    return ws
+
+# 实际上最简单可靠的做法：
+# websockets 内部已经针对延迟做了优化，TCP_NODELAY 影响有限。
+# 直接去掉 _make_socket，用标准 websockets.connect 即可。
+```
+
+---
+
+### 2. `session.py` — `AudioStreamServer._make_ws_connection` 签名错误
+
+```python
+# 现在的代码：
+self._server = await websockets.serve(
+    self._on_connect,
+    self._host,
+    self._port,
+    compression=None,
+    create_connection=self._make_ws_connection,  # ❌ 这个参数不存在
+)
+
+# websockets.serve 没有 create_connection 参数。
+# 运行时会抛出：
+# TypeError: serve() got an unexpected keyword argument 'create_connection'
+```
+
+```python
+# 正确做法：
+async def start(self):
+    self._server = await websockets.serve(
+        self._on_connect,
+        self._host,
+        self._port,
+        compression=None,        # ✅ 这个参数是有效的
+        # TCP_NODELAY 通过 process_request 钩子或连接后设置
+    )
+
+# 如果确实需要 TCP_NODELAY，在 _on_connect 里设置：
+async def _on_connect(self, ws, path: str):
+    # 连接建立后立即设置
+    import socket as _socket
+    transport = ws.transport
+    if transport:
+        sock = transport.get_extra_info("socket")
+        if sock:
+            sock.setsockopt(_socket.IPPROTO_TCP, _socket.TCP_NODELAY, 1)
+    # ... 后续逻辑不变
+```
+
+---
+
+### 3. `session.py` — `on_channel_answer` 中 `start_fifo` 调用顺序错误
+
+```python
+# 现在的代码：
+session.start(
+    loop=self._loop,
+    esl_conn=self._esl,
+    metrics=self._metrics,
+    audio_server=None,
+)
+# ❌ start() 里会启动 _ai_main 协程，_ai_main 立即开始从 fs_to_ai_queue 读数据
+# 但 FIFO 还没开始读，uuid_record 还没发出
+# 导致：AI 收不到任何音频
+
+try:
+    self._esl.send_bgapi_nowait(
+        f"uuid_record {call_uuid} start {fifo_path} 1800"
+    )
+except Exception as e:
+    ...
+    return
+
+session.start_fifo()   # ❌ 在 start() 之后才启动 FIFO 读取
+
+# 正确顺序：
+# 1. 先发 uuid_record（让 FS 开始写 FIFO）
+# 2. 再 start_fifo()（让读线程准备好）
+# 3. 最后 start()（启动 AI 协程）
+try:
+    self._esl.send_bgapi_nowait(
+        f"uuid_record {call_uuid} start {fifo_path} 1800"
+    )
+except Exception as e:
+    logger.error(f"[{call_uuid}] uuid_record failed: {e}")
+    return
+
+session.start_fifo()   # ✅ 先启动 FIFO 读线程（会阻塞等待写入方）
+
+session.start(         # ✅ 再启动 AI（此时 FIFO 读线程已就绪）
+    loop=self._loop,
+    esl_conn=self._esl,
+    metrics=self._metrics,
+    audio_server=None,
+)
+```
+
+---
+
+### 4. `esl.py` — `_dispatch_event` 内层 body 解析在多数事件上失败
+
+```python
+# 现在的代码：
+inner_cl   = int(event_headers.get("Content-Length", 0))
+inner_body = ""
+if inner_cl > 0:
+    split = body.find("\\n\\n")   # ❌ 转义问题：在实际字符串里是 \n\n
+    if split != -1:
+        inner_body = body[split + 2: split + 2 + inner_cl]
+
+# 问题：
+# 1. body 是从 socket 读来的真实字符串，换行符是 \n（一个字节），不是 \\n\\n
+# 2. body.find("\\n\\n") 永远找不到，inner_body 永远是空字符串
+# 3. BACKGROUND_JOB 的结果永远是空，send_bgapi 返回空字符串
+
+# 正确做法：
+if inner_cl > 0:
+    split = body.find("\n\n")     # ✅ 真正的双换行
+    if split != -1:
+        inner_body = body[split + 2: split + 2 + inner_cl]
+    else:
+        # 有些 ESL 实现只有单换行分隔
+        split = body.find("\n")
+        if split != -1:
+            inner_body = body[split + 1: split + 1 + inner_cl]
+```
+
+---
+
+### 5. `audio_utils.py` 桩实现会产生严重噪音
+
+```python
+# 现在的桩：
+def pcma_to_pcm(pcma: np.ndarray) -> np.ndarray:
+    return pcma.astype(np.int16)   # ❌ 直接类型转换，完全不是 G.711a 解码
+
+def pcm_to_pcma(pcm: np.ndarray) -> bytes:
+    return pcm.astype(np.uint8).tobytes()  # ❌ 同上
+
+# 结果：AI 听到的是噪音，输出给用户的也是噪音。
+# 通话完全无法使用。
+
+# 最简单的可用实现（用 audioop，Python 内置）：
+import audioop
+
+def pcma_to_pcm(pcma_bytes: bytes) -> np.ndarray:
+    """G.711a → PCM16LE"""
+    pcm_bytes = audioop.alaw2lin(pcma_bytes, 2)   # 2 = 16bit
+    return np.frombuffer(pcm_bytes, dtype=np.int16)
+
+def pcm_to_pcma(pcm: np.ndarray) -> bytes:
+    """PCM16LE → G.711a"""
+    pcm_bytes = pcm.astype(np.int16).tobytes()
+    return audioop.lin2alaw(pcm_bytes, 2)
+
+# 注意：audioop 在 Python 3.13 已被移除。
+# 如果用 3.13+，改用：pip install audioop-lts
+# 或者：pip install pyg711
+
+# 重采样也需要替换，线性插值在语音上有明显失真：
+# pip install soxr
+import soxr
+
+def RESAMPLE_FUNC(data: np.ndarray, src_rate: int, dst_rate: int) -> np.ndarray:
+    if src_rate == dst_rate:
+        return data
+    return soxr.resample(data.astype(np.float32), src_rate, dst_rate).astype(np.int16)
+```
+
+---
+
+## 🟡 部署前需要确认
+
+### 6. FreeSWITCH `mod_audio_stream` 是否已安装
+
+```bash
+# 在 FS 控制台检查：
+freeswitch> module_exists mod_audio_stream
+
+# 如果没有，需要编译安装：
+# https://github.com/drachtio/mod_audio_stream
+# 或者在 config.py 设置：
+USE_AUDIO_STREAM = False   # 降级到 FIFO 模式
+```
+
+### 7. FS Dialplan 中 `audio_stream` 的 UUID 传递
+
+```xml
+<!-- 你的 dialplan 必须把 uuid 传给网关，否则无法匹配 session -->
+<action application="audio_stream"
+        data="ws://127.0.0.1:8081/${uuid} 8000 mono"/>
+<!--                                ↑↑↑↑↑↑
+        ${uuid} 会展开为通话的 UUID，
+        网关的 _on_connect 从 path 里取出来做路由 -->
+```
+
+### 8. ESL 事件循环线程异常后无重连机制
+
+```python
+# esl.py 的 _event_loop 退出后，整个网关就聋了：
+# 不再收到任何 CHANNEL_ANSWER / CHANNEL_HANGUP 事件
+# 正在通话的 session 不受影响，但新来的电话全部无响应
+
+# 最小可用的重连：
+def _event_loop(self):
+    while self._running:
+        try:
+            headers = self._read_headers()
+            # ... 正常处理
+        except ConnectionError:
+            logger.error("ESL disconnected, reconnecting in 5s...")
+            self._connected = False
+            time.sleep(5)
+            if self._reconnect():
+                logger.info("ESL reconnected")
+            # 重连后需要重新 subscribe
+
+def _reconnect(self) -> bool:
+    try:
+        self._buf = b""
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._sock.settimeout(10)
+        self._sock.connect((self.host, self.port))
+        self._sock.settimeout(None)
+        # 重新握手
+        headers = self._read_headers()
+        self._raw_send(f"auth {self.password}\n\n")
+        headers = self._read_headers()
+        self._connected = True
+        # 重新订阅（需要外部传入订阅列表，或缓存）
+        return True
+    except Exception as e:
+        logger.error(f"ESL reconnect failed: {e}")
+        return False
+```
+
+### 9. `/tmp` 目录 PCMA 文件积累
+
+```bash
+# FIFO 模式下，如果进程异常退出，临时文件不会清理
+# 长时间运行后 /tmp 会被撑满
+
+# 建议加一个启动时清理：
+def main():
+    # 清理上次异常退出留下的临时文件
+    import glob
+    for f in glob.glob("/tmp/minicpm_*.pcma"):
+        os.remove(f)
+    for d in glob.glob("/tmp/ai_*_*/"):
+        shutil.rmtree(d, ignore_errors=True)
+```
+
+### 10. Python 版本确认
+
+```bash
+python --version
+# 需要 >= 3.10（使用了 match/case 语法风格的类型注解）
+# 需要 >= 3.11（dataclass 的某些行为）
+# 建议使用 3.11 或 3.12
+
+# audioop 在 3.13 被移除，如果用 3.13：
+pip install audioop-lts
+```
+
+---
+
+## 最终部署清单
+
+```
+修复项                              优先级   预计时间
+─────────────────────────────────── ──────── ────────
+[1] 修复 _make_socket 冲突           🔴 必须   10 min
+[2] 修复 create_connection 参数      🔴 必须   5  min
+[3] 修复 FIFO start 调用顺序         🔴 必须   5  min
+[4] 修复 \\n\\n 转义 bug             🔴 必须   2  min
+[5] 替换 audio_utils 桩实现          🔴 必须   30 min
+[6] 确认 mod_audio_stream 已安装     🟡 确认   —
+[7] 确认 dialplan UUID 传递          🟡 确认   —
+[8] 加 ESL 断线重连                  🟡 建议   1  hr
+[9] 加启动时 /tmp 清理               🟡 建议   5  min
+[10] 确认 Python 版本 + audioop      🟡 确认   —
+```
+
+修完这些，生产环境应该可以稳定运行。
