@@ -1,0 +1,696 @@
+先回答你两个概念问题。
+
+1. Prometheus metrics 是做什么的？
+
+这是“监控指标系统”。
+
+你可以理解成：
+“给服务器做实时体检”。
+
+例如你能看到：
+
+- 当前通话数
+- AI websocket 数量
+- 平均 ASR 延迟
+- AI 回复耗时
+- 音频队列积压
+- barge-in 次数
+- CPU / 内存
+- 丢帧数量
+- websocket reconnect 次数
+
+典型用途：
+
+```text
+active_calls 23
+avg_ai_latency_ms 412
+audio_queue_overflow_total 3
+```
+
+然后接 Grafana：
+
+你会得到实时仪表盘。
+
+生产环境非常重要。
+
+否则：
+“电话为什么卡？”
+你完全不知道。
+
+-----------------------------------
+
+2. OpenTelemetry tracing 是做什么的？
+
+这是“调用链追踪”。
+
+它能记录：
+
+一次电话请求从：
+- FreeSWITCH
+- Python gateway
+- AI websocket
+- TTS
+- playback
+
+整个路径耗时。
+
+例如：
+
+```text
+Call Start
+ ├── ESL event: 4ms
+ ├── audio upload: 32ms
+ ├── ASR latency: 280ms
+ ├── LLM latency: 610ms
+ ├── TTS latency: 190ms
+ └── playback start: 75ms
+```
+
+你可以精准定位：
+到底哪一步慢。
+
+大型实时语音系统几乎都会用。
+
+-----------------------------------
+
+现在进入你真正关心的部分。
+
+你要求：
+
+- 完整 ai_client.py
+- 完整 session.py
+- 真正低延迟 RTP 架构
+- mod_audio_stream 方案
+
+这是核心。
+
+而且：
+真正低延迟版本里，
+FIFO 已经不推荐了。
+
+========================================
+为什么 FIFO 不是最佳方案
+========================================
+
+FIFO 本质：
+
+```text
+FreeSWITCH
+ -> uuid_record
+ -> pipe
+ -> Python
+```
+
+问题：
+
+- 延迟高
+- 容易阻塞
+- playback 不是流式
+- 文件方案 IO 大
+- 不是真 RTP
+
+真正生产级语音 AI：
+通常是：
+
+```text
+RTP/media bug
+ -> websocket stream
+ -> AI
+ -> RTP inject
+```
+
+也就是说：
+根本不经过文件。
+
+========================================
+推荐架构（生产级）
+========================================
+
+你现在真正应该做的是：
+
+========================================
+方案A（推荐）
+mod_audio_stream
+========================================
+
+FreeSWITCH:
+直接 websocket 推流。
+
+Python:
+只做 AI gateway。
+
+架构：
+
+```text
+Caller
+  ↓ RTP
+FreeSWITCH
+  ↓ websocket
+Python AI Gateway
+  ↓ websocket
+OpenAI Realtime
+  ↓ websocket audio
+FreeSWITCH playback
+```
+
+优点：
+
+- 真流式
+- 低延迟
+- 无 FIFO
+- 无文件
+- 无 uuid_record
+- 无 wav 临时文件
+- 并发强
+- 稳定
+
+========================================
+延迟对比
+========================================
+
+FIFO + wav：
+
+通常：
+700ms ~ 2s
+
+mod_audio_stream：
+
+通常：
+250ms ~ 600ms
+
+差距非常大。
+
+========================================
+你真正需要安装：
+========================================
+
+mod_audio_stream
+
+或者：
+
+mod_audio_fork
+
+========================================
+推荐：
+mod_audio_stream
+========================================
+
+GitHub：
+
+```text
+https://github.com/amigniter/mod_audio_stream
+```
+
+========================================
+FreeSWITCH 配置
+========================================
+
+dialplan：
+
+```xml
+<action application="answer"/>
+
+<action application="audio_stream"
+data="wss://your-gateway/ws mono 16k"/>
+
+<action application="park"/>
+```
+
+这样：
+
+FS 自动：
+- 采集 RTP
+- 转 16k
+- websocket 发给 Python
+
+Python 不再需要：
+- FIFO
+- uuid_record
+- 文件
+
+========================================
+这是正确方向。
+========================================
+
+下面开始给你真正需要的代码。
+
+========================================
+完整 ai_client.py
+========================================
+
+```python
+import asyncio
+import base64
+import json
+import logging
+
+import websockets
+
+from app.config import *
+
+logger = logging.getLogger(__name__)
+
+
+class AIClient:
+
+    def __init__(self, session):
+
+        self.session = session
+
+        self.ws = None
+
+        self.connected = False
+
+        self.pending_ms = 0
+
+    # ------------------------------------------------
+
+    async def connect(self):
+
+        headers = {
+            "Authorization": f"Bearer {AI_API_KEY}",
+            "OpenAI-Beta": "realtime=v1"
+        }
+
+        self.ws = await websockets.connect(
+            AI_WS_URL,
+            additional_headers=headers,
+            ping_interval=20,
+            ping_timeout=10
+        )
+
+        self.connected = True
+
+        asyncio.create_task(
+            self.recv_loop()
+        )
+
+        await self.initialize()
+
+    # ------------------------------------------------
+
+    async def initialize(self):
+
+        while True:
+
+            msg = await self.ws.recv()
+
+            data = json.loads(msg)
+
+            if data.get("type") == "session.created":
+                break
+
+        await self.ws.send(json.dumps({
+            "type": "session.update",
+            "session": {
+                "voice": "alloy",
+                "instructions":
+                    "你是中文电话客服助手，"
+                    "回答简洁自然。",
+                "input_audio_format": "pcm16",
+                "output_audio_format": "pcm16",
+                "turn_detection": {
+                    "type": "server_vad"
+                }
+            }
+        }))
+
+    # ------------------------------------------------
+
+    async def send_audio(self, pcm16):
+
+        if not self.connected:
+            return
+
+        b64 = base64.b64encode(
+            pcm16
+        ).decode()
+
+        await self.ws.send(json.dumps({
+            "type": "input_audio_buffer.append",
+            "audio": b64
+        }))
+
+        self.pending_ms += 20
+
+        if self.pending_ms >= 400:
+
+            await self.ws.send(json.dumps({
+                "type": "input_audio_buffer.commit"
+            }))
+
+            self.pending_ms = 0
+
+    # ------------------------------------------------
+
+    async def send_text(self, text):
+
+        await self.ws.send(json.dumps({
+            "type": "conversation.item.create",
+            "item": {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": text
+                    }
+                ]
+            }
+        }))
+
+        await self.ws.send(json.dumps({
+            "type": "response.create"
+        }))
+
+    # ------------------------------------------------
+
+    async def interrupt(self):
+
+        if not self.connected:
+            return
+
+        await self.ws.send(json.dumps({
+            "type": "response.cancel"
+        }))
+
+        await self.ws.send(json.dumps({
+            "type": "input_audio_buffer.clear"
+        }))
+
+    # ------------------------------------------------
+
+    async def recv_loop(self):
+
+        try:
+
+            async for msg in self.ws:
+
+                data = json.loads(msg)
+
+                msg_type = data.get("type", "")
+
+                # AI audio
+                if msg_type == "response.output_audio.delta":
+
+                    audio = base64.b64decode(
+                        data["delta"]
+                    )
+
+                    self.session.on_ai_audio(
+                        audio
+                    )
+
+                # AI done
+                elif msg_type == "response.output_audio.done":
+
+                    self.session.on_ai_done()
+
+                # user speech
+                elif msg_type == "input_audio_buffer.speech_started":
+
+                    self.session.on_user_speech()
+
+                # transcript
+                elif msg_type == (
+                    "conversation.item."
+                    "input_audio_transcription.completed"
+                ):
+
+                    logger.info(
+                        "[%s] transcript: %s",
+                        self.session.uuid,
+                        data.get("transcript")
+                    )
+
+        except Exception:
+            logger.exception(
+                "AI recv loop"
+            )
+
+        finally:
+            self.connected = False
+
+    # ------------------------------------------------
+
+    async def close(self):
+
+        self.connected = False
+
+        if self.ws:
+            await self.ws.close()
+```
+
+========================================
+完整 session.py
+========================================
+
+这里给的是：
+mod_audio_stream 架构。
+
+不再需要 FIFO。
+
+========================================
+
+```python
+import asyncio
+import base64
+import logging
+import threading
+import time
+
+from app.ai_client import AIClient
+from app.audio import (
+    bytes_to_pcm16,
+    pcm16_to_bytes,
+    resample,
+)
+
+logger = logging.getLogger(__name__)
+
+
+class CallSession:
+
+    def __init__(
+        self,
+        uuid_,
+        websocket,
+        loop
+    ):
+
+        self.uuid = uuid_
+
+        self.ws = websocket
+
+        self.loop = loop
+
+        self.ai = None
+
+        self.active = True
+
+        self.is_ai_speaking = False
+
+        self.play_lock = threading.Lock()
+
+    # ------------------------------------------------
+
+    async def start(self):
+
+        self.ai = AIClient(self)
+
+        await self.ai.connect()
+
+        logger.info(
+            "[%s] session started",
+            self.uuid
+        )
+
+    # ------------------------------------------------
+
+    async def on_rtp_audio(self, audio_bytes):
+
+        if not self.active:
+            return
+
+        pcm16 = bytes_to_pcm16(
+            audio_bytes
+        )
+
+        pcm16_16k = resample(
+            pcm16,
+            8000,
+            16000
+        )
+
+        await self.ai.send_audio(
+            pcm16_to_bytes(
+                pcm16_16k
+            )
+        )
+
+    # ------------------------------------------------
+
+    def on_ai_audio(self, pcm16_16k):
+
+        if not self.active:
+            return
+
+        self.is_ai_speaking = True
+
+        pcm16 = bytes_to_pcm16(
+            pcm16_16k
+        )
+
+        pcm8k = resample(
+            pcm16,
+            16000,
+            8000
+        )
+
+        out = pcm16_to_bytes(
+            pcm8k
+        )
+
+        asyncio.run_coroutine_threadsafe(
+            self.send_audio_to_fs(out),
+            self.loop
+        )
+
+    # ------------------------------------------------
+
+    async def send_audio_to_fs(self, pcm16):
+
+        if not self.active:
+            return
+
+        try:
+
+            await self.ws.send_bytes(
+                pcm16
+            )
+
+        except Exception:
+            logger.exception(
+                "send audio to FS"
+            )
+
+    # ------------------------------------------------
+
+    def on_ai_done(self):
+
+        self.is_ai_speaking = False
+
+    # ------------------------------------------------
+
+    def on_user_speech(self):
+
+        if self.is_ai_speaking:
+            self.barge_in()
+
+    # ------------------------------------------------
+
+    def barge_in(self):
+
+        logger.info(
+            "[%s] barge-in",
+            self.uuid
+        )
+
+        asyncio.run_coroutine_threadsafe(
+            self.ai.interrupt(),
+            self.loop
+        )
+
+        self.is_ai_speaking = False
+
+    # ------------------------------------------------
+
+    async def close(self):
+
+        self.active = False
+
+        if self.ai:
+            await self.ai.close()
+```
+
+========================================
+真正低延迟 WebSocket RTP Server
+========================================
+
+FastAPI websocket:
+
+```python
+from fastapi import WebSocket
+
+@app.websocket("/media/{call_id}")
+async def media_ws(
+    websocket: WebSocket,
+    call_id: str
+):
+
+    await websocket.accept()
+
+    session = CallSession(
+        call_id,
+        websocket,
+        asyncio.get_running_loop()
+    )
+
+    await session.start()
+
+    try:
+
+        while True:
+
+            audio = await websocket.receive_bytes()
+
+            await session.on_rtp_audio(
+                audio
+            )
+
+    except Exception:
+        pass
+
+    finally:
+        await session.close()
+```
+
+========================================
+这才是真生产级低延迟。
+========================================
+
+延迟会明显下降。
+
+因为：
+已经没有：
+
+- fifo
+- wav
+- 文件
+- uuid_record
+- uuid_broadcast
+
+========================================
+最终建议
+========================================
+
+你真正应该做：
+
+✅ mod_audio_stream
+✅ websocket streaming
+✅ realtime api
+✅ 无文件
+✅ 无 FIFO
+
+而不是继续修补：
+uuid_record/fifo 架构。
+
+因为：
+那条路最终一定会碰到：
+- IO 瓶颈
+- 延迟
+- 并发
+- playback race
+
+你现在已经接近：
+“真正电话 AI 平台”的门槛了。
