@@ -428,3 +428,3749 @@ Next file set should be:
 4. session/call_session.py
 
 That’s where the actual duplex realtime pipeline begins.
+
+File: src/ai/protocol.py
+
+```python
+from __future__ import annotations
+
+from dataclasses import dataclass
+from enum import Enum
+
+
+class MiniCPMMessageType(str, Enum):
+    SESSION_CREATED = "session.created"
+
+    INPUT_AUDIO_BUFFER_APPEND = "input_audio_buffer.append"
+    INPUT_AUDIO_BUFFER_COMMIT = "input_audio_buffer.commit"
+
+    RESPONSE_AUDIO_DELTA = "response.audio.delta"
+    RESPONSE_AUDIO_DONE = "response.audio.done"
+
+    RESPONSE_STARTED = "response.started"
+    RESPONSE_DONE = "response.done"
+
+    ERROR = "error"
+
+    INTERRUPT = "response.interrupt"
+
+    PING = "ping"
+    PONG = "pong"
+
+
+@dataclass(slots=True)
+class AudioFrame:
+    audio: bytes
+    timestamp_ms: int | None = None
+
+
+@dataclass(slots=True)
+class OutboundAudioFrame:
+    generation_id: int
+    audio: bytes
+
+
+@dataclass(slots=True)
+class InterruptEvent:
+    generation_id: int
+```
+
+--------------------------------------------------
+File: src/ai/minicpm_client.py
+--------------------------------------------------
+
+```python
+from __future__ import annotations
+
+import asyncio
+import base64
+import contextlib
+
+import orjson
+import structlog
+import websockets
+
+from ai.protocol import MiniCPMMessageType
+from ai.protocol import OutboundAudioFrame
+from config.settings import get_settings
+
+logger = structlog.get_logger(__name__)
+
+
+class MiniCPMClient:
+    def __init__(
+        self,
+        session_id: str,
+        outbound_audio_queue: asyncio.Queue[OutboundAudioFrame],
+    ) -> None:
+        self.settings = get_settings()
+
+        self.session_id = session_id
+
+        self.outbound_audio_queue = outbound_audio_queue
+
+        self.websocket: websockets.WebSocketClientProtocol | None = None
+
+        self.read_task: asyncio.Task | None = None
+
+        self.connected = False
+
+        self.current_generation_id = 0
+
+        self._write_lock = asyncio.Lock()
+
+    async def connect(self) -> None:
+        logger.info(
+            "minicpm_connecting",
+            session_id=self.session_id,
+        )
+
+        headers = {
+            "Authorization": f"Bearer {self.settings.minicpm_api_key}",
+        }
+
+        self.websocket = await websockets.connect(
+            self.settings.minicpm_ws_url,
+            extra_headers=headers,
+            max_size=None,
+            ping_interval=self.settings.websocket_ping_interval,
+            ping_timeout=self.settings.websocket_ping_timeout,
+            open_timeout=self.settings.minicpm_connect_timeout_seconds,
+        )
+
+        self.connected = True
+
+        self.read_task = asyncio.create_task(
+            self._reader_loop(),
+            name=f"minicpm-reader-{self.session_id}",
+        )
+
+        logger.info(
+            "minicpm_connected",
+            session_id=self.session_id,
+        )
+
+    async def close(self) -> None:
+        self.connected = False
+
+        if self.read_task:
+            self.read_task.cancel()
+
+            with contextlib.suppress(asyncio.CancelledError):
+                await self.read_task
+
+        if self.websocket:
+            await self.websocket.close()
+
+        logger.info(
+            "minicpm_closed",
+            session_id=self.session_id,
+        )
+
+    async def send_audio(self, pcm: bytes) -> None:
+        if not self.websocket:
+            raise RuntimeError("MiniCPM websocket not connected")
+
+        payload = {
+            "type": MiniCPMMessageType.INPUT_AUDIO_BUFFER_APPEND.value,
+            "audio": base64.b64encode(pcm).decode(),
+        }
+
+        async with self._write_lock:
+            await self.websocket.send(
+                orjson.dumps(payload).decode()
+            )
+
+    async def commit_audio(self) -> None:
+        if not self.websocket:
+            return
+
+        payload = {
+            "type": MiniCPMMessageType.INPUT_AUDIO_BUFFER_COMMIT.value,
+        }
+
+        async with self._write_lock:
+            await self.websocket.send(
+                orjson.dumps(payload).decode()
+            )
+
+    async def interrupt(self) -> int:
+        if not self.websocket:
+            return self.current_generation_id
+
+        self.current_generation_id += 1
+
+        generation_id = self.current_generation_id
+
+        payload = {
+            "type": MiniCPMMessageType.INTERRUPT.value,
+        }
+
+        logger.info(
+            "sending_interrupt",
+            session_id=self.session_id,
+            generation_id=generation_id,
+        )
+
+        async with self._write_lock:
+            await self.websocket.send(
+                orjson.dumps(payload).decode()
+            )
+
+        return generation_id
+
+    async def _reader_loop(self) -> None:
+        assert self.websocket is not None
+
+        async for raw_message in self.websocket:
+            try:
+                if isinstance(raw_message, bytes):
+                    continue
+
+                message = orjson.loads(raw_message)
+
+                await self._handle_message(message)
+
+            except Exception:
+                logger.exception(
+                    "minicpm_reader_error",
+                    session_id=self.session_id,
+                )
+
+    async def _handle_message(self, message: dict) -> None:
+        message_type = message.get("type")
+
+        if message_type == MiniCPMMessageType.RESPONSE_STARTED.value:
+            self.current_generation_id += 1
+
+            logger.info(
+                "response_started",
+                session_id=self.session_id,
+                generation_id=self.current_generation_id,
+            )
+
+            return
+
+        if message_type == MiniCPMMessageType.RESPONSE_AUDIO_DELTA.value:
+            audio_b64 = message.get("audio")
+
+            if not audio_b64:
+                return
+
+            pcm = base64.b64decode(audio_b64)
+
+            frame = OutboundAudioFrame(
+                generation_id=self.current_generation_id,
+                audio=pcm,
+            )
+
+            await self.outbound_audio_queue.put(frame)
+
+            return
+
+        if message_type == MiniCPMMessageType.RESPONSE_DONE.value:
+            logger.info(
+                "response_done",
+                session_id=self.session_id,
+                generation_id=self.current_generation_id,
+            )
+
+            return
+
+        if message_type == MiniCPMMessageType.ERROR.value:
+            logger.error(
+                "minicpm_error",
+                session_id=self.session_id,
+                payload=message,
+            )
+
+            return
+```
+
+--------------------------------------------------
+File: src/session/state.py
+--------------------------------------------------
+
+```python
+from enum import Enum
+
+
+class CallState(str, Enum):
+    INITIALIZING = "initializing"
+
+    ACTIVE = "active"
+
+    INTERRUPTING = "interrupting"
+
+    CLOSING = "closing"
+
+    CLOSED = "closed"
+```
+
+--------------------------------------------------
+File: src/audio/vad.py
+--------------------------------------------------
+
+```python
+from __future__ import annotations
+
+import webrtcvad
+
+from config.settings import get_settings
+
+
+class VoiceActivityDetector:
+    def __init__(self) -> None:
+        settings = get_settings()
+
+        self.sample_rate = settings.audio_sample_rate
+        self.frame_ms = settings.vad_frame_ms
+
+        self.vad = webrtcvad.Vad(settings.vad_aggressiveness)
+
+    def is_speech(self, pcm: bytes) -> bool:
+        return self.vad.is_speech(
+            pcm,
+            self.sample_rate,
+        )
+```
+
+--------------------------------------------------
+File: src/audio/playback_buffer.py
+--------------------------------------------------
+
+```python
+from __future__ import annotations
+
+import asyncio
+
+from ai.protocol import OutboundAudioFrame
+
+
+class PlaybackBuffer:
+    def __init__(self) -> None:
+        self.queue: asyncio.Queue[OutboundAudioFrame] = asyncio.Queue()
+
+    async def put(self, frame: OutboundAudioFrame) -> None:
+        await self.queue.put(frame)
+
+    async def get(self) -> OutboundAudioFrame:
+        return await self.queue.get()
+
+    def clear_generation(self, generation_id: int) -> None:
+        retained: list[OutboundAudioFrame] = []
+
+        while not self.queue.empty():
+            frame = self.queue.get_nowait()
+
+            if frame.generation_id == generation_id:
+                retained.append(frame)
+
+        for frame in retained:
+            self.queue.put_nowait(frame)
+```
+
+--------------------------------------------------
+File: src/session/call_session.py
+--------------------------------------------------
+
+```python
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import time
+from uuid import uuid4
+
+import structlog
+from websockets.server import WebSocketServerProtocol
+
+from ai.minicpm_client import MiniCPMClient
+from ai.protocol import OutboundAudioFrame
+from audio.playback_buffer import PlaybackBuffer
+from audio.vad import VoiceActivityDetector
+from config.settings import get_settings
+from infra.metrics import ACTIVE_CALLS
+from infra.metrics import AUDIO_IN_BYTES
+from infra.metrics import AUDIO_OUT_BYTES
+from infra.metrics import INTERRUPT_COUNT
+from session.state import CallState
+
+logger = structlog.get_logger(__name__)
+
+
+class CallSession:
+    def __init__(
+        self,
+        websocket: WebSocketServerProtocol,
+    ) -> None:
+        self.settings = get_settings()
+
+        self.session_id = str(uuid4())
+
+        self.websocket = websocket
+
+        self.state = CallState.INITIALIZING
+
+        self.created_at = time.monotonic()
+
+        self.inbound_audio_queue: asyncio.Queue[bytes] = asyncio.Queue(
+            maxsize=self.settings.inbound_audio_queue_size
+        )
+
+        self.outbound_audio_queue: asyncio.Queue[OutboundAudioFrame] = asyncio.Queue(
+            maxsize=self.settings.outbound_audio_queue_size
+        )
+
+        self.playback_buffer = PlaybackBuffer()
+
+        self.vad = VoiceActivityDetector()
+
+        self.minicpm = MiniCPMClient(
+            session_id=self.session_id,
+            outbound_audio_queue=self.outbound_audio_queue,
+        )
+
+        self.tasks: list[asyncio.Task] = []
+
+        self.current_generation_id = 0
+
+        self.consecutive_speech_frames = 0
+
+    async def start(self) -> None:
+        ACTIVE_CALLS.inc()
+
+        logger.info(
+            "call_session_starting",
+            session_id=self.session_id,
+        )
+
+        await self.minicpm.connect()
+
+        self.state = CallState.ACTIVE
+
+        self.tasks.extend(
+            [
+                asyncio.create_task(
+                    self._inbound_audio_loop(),
+                    name=f"inbound-audio-{self.session_id}",
+                ),
+                asyncio.create_task(
+                    self._outbound_audio_loop(),
+                    name=f"outbound-audio-{self.session_id}",
+                ),
+            ]
+        )
+
+        logger.info(
+            "call_session_started",
+            session_id=self.session_id,
+        )
+
+    async def close(self) -> None:
+        self.state = CallState.CLOSING
+
+        logger.info(
+            "call_session_closing",
+            session_id=self.session_id,
+        )
+
+        for task in self.tasks:
+            task.cancel()
+
+        for task in self.tasks:
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+        await self.minicpm.close()
+
+        ACTIVE_CALLS.dec()
+
+        self.state = CallState.CLOSED
+
+        logger.info(
+            "call_session_closed",
+            session_id=self.session_id,
+        )
+
+    async def receive_audio(self, pcm: bytes) -> None:
+        AUDIO_IN_BYTES.inc(len(pcm))
+
+        await self.inbound_audio_queue.put(pcm)
+
+    async def _inbound_audio_loop(self) -> None:
+        while True:
+            pcm = await self.inbound_audio_queue.get()
+
+            speech = self.vad.is_speech(pcm)
+
+            if speech:
+                self.consecutive_speech_frames += 1
+            else:
+                self.consecutive_speech_frames = 0
+
+            required_frames = (
+                self.settings.interrupt_speech_ms
+                // self.settings.audio_chunk_ms
+            )
+
+            if self.consecutive_speech_frames >= required_frames:
+                await self._handle_interrupt()
+
+            await self.minicpm.send_audio(pcm)
+
+    async def _outbound_audio_loop(self) -> None:
+        while True:
+            frame = await self.outbound_audio_queue.get()
+
+            if frame.generation_id != self.minicpm.current_generation_id:
+                logger.debug(
+                    "dropping_stale_audio",
+                    session_id=self.session_id,
+                    generation_id=frame.generation_id,
+                )
+
+                continue
+
+            AUDIO_OUT_BYTES.inc(len(frame.audio))
+
+            await self.websocket.send(frame.audio)
+
+    async def _handle_interrupt(self) -> None:
+        self.consecutive_speech_frames = 0
+
+        INTERRUPT_COUNT.inc()
+
+        logger.info(
+            "interrupt_detected",
+            session_id=self.session_id,
+        )
+
+        generation_id = await self.minicpm.interrupt()
+
+        self.current_generation_id = generation_id
+
+File: src/audio/pcm.py
+
+```python
+from __future__ import annotations
+
+import audioop
+
+import numpy as np
+
+
+def pcm16_bytes_to_float32(pcm: bytes) -> np.ndarray:
+    audio = np.frombuffer(pcm, dtype=np.int16)
+
+    return audio.astype(np.float32) / 32768.0
+
+
+def float32_to_pcm16_bytes(audio: np.ndarray) -> bytes:
+    clipped = np.clip(audio, -1.0, 1.0)
+
+    int16_audio = (clipped * 32767.0).astype(np.int16)
+
+    return int16_audio.tobytes()
+
+
+def resample_audio(
+    pcm: bytes,
+    source_rate: int,
+    target_rate: int,
+) -> bytes:
+    if source_rate == target_rate:
+        return pcm
+
+    return audioop.ratecv(
+        pcm,
+        2,
+        1,
+        source_rate,
+        target_rate,
+        None,
+    )[0]
+
+
+def ulaw_to_pcm16(ulaw_data: bytes) -> bytes:
+    return audioop.ulaw2lin(ulaw_data, 2)
+
+
+def pcm16_to_ulaw(pcm_data: bytes) -> bytes:
+    return audioop.lin2ulaw(pcm_data, 2)
+```
+
+--------------------------------------------------
+File: src/audio/jitter_buffer.py
+--------------------------------------------------
+
+```python
+from __future__ import annotations
+
+import asyncio
+import time
+from dataclasses import dataclass
+
+
+@dataclass(slots=True)
+class BufferedAudioFrame:
+    audio: bytes
+    received_at: float
+
+
+class JitterBuffer:
+    def __init__(
+        self,
+        target_delay_ms: int = 60,
+        max_frames: int = 64,
+    ) -> None:
+        self.target_delay_ms = target_delay_ms
+
+        self.queue: asyncio.Queue[BufferedAudioFrame] = asyncio.Queue(
+            maxsize=max_frames
+        )
+
+    async def put(self, audio: bytes) -> None:
+        frame = BufferedAudioFrame(
+            audio=audio,
+            received_at=time.monotonic(),
+        )
+
+        await self.queue.put(frame)
+
+    async def get(self) -> bytes:
+        frame = await self.queue.get()
+
+        return frame.audio
+```
+
+--------------------------------------------------
+File: src/session/interrupt.py
+--------------------------------------------------
+
+```python
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+
+@dataclass(slots=True)
+class InterruptState:
+    active_generation_id: int = 0
+
+    interrupted: bool = False
+
+    def next_generation(self) -> int:
+        self.active_generation_id += 1
+
+        self.interrupted = True
+
+        return self.active_generation_id
+
+    def clear(self) -> None:
+        self.interrupted = False
+```
+
+--------------------------------------------------
+File: src/freeswitch/connection.py
+--------------------------------------------------
+
+```python
+from __future__ import annotations
+
+import asyncio
+
+import structlog
+from websockets.server import WebSocketServerProtocol
+
+from session.call_session import CallSession
+
+logger = structlog.get_logger(__name__)
+
+
+class FreeSwitchConnectionHandler:
+    def __init__(
+        self,
+        websocket: WebSocketServerProtocol,
+    ) -> None:
+        self.websocket = websocket
+
+        self.session = CallSession(
+            websocket=websocket,
+        )
+
+        self.reader_task: asyncio.Task | None = None
+
+    async def run(self) -> None:
+        await self.session.start()
+
+        self.reader_task = asyncio.create_task(
+            self._reader_loop(),
+            name=f"freeswitch-reader-{self.session.session_id}",
+        )
+
+        try:
+            await self.reader_task
+
+        finally:
+            await self.session.close()
+
+    async def _reader_loop(self) -> None:
+        async for message in self.websocket:
+            if not isinstance(message, bytes):
+                logger.warning(
+                    "non_binary_audio_frame",
+                    session_id=self.session.session_id,
+                )
+                continue
+
+            await self.session.receive_audio(message)
+
+            
+```
+
+--------------------------------------------------
+UPDATED FILE: src/freeswitch/ws_server.py
+--------------------------------------------------
+
+Replace entire file with:
+
+```python
+from __future__ import annotations
+
+import structlog
+import websockets
+from websockets.server import WebSocketServerProtocol
+
+from config.settings import get_settings
+from freeswitch.connection import FreeSwitchConnectionHandler
+
+logger = structlog.get_logger(__name__)
+
+
+class FreeSwitchAudioServer:
+    def __init__(self) -> None:
+        self.settings = get_settings()
+
+        self._server: websockets.WebSocketServer | None = None
+
+        self._active_connections: set[WebSocketServerProtocol] = set()
+
+    async def start(self) -> None:
+        self._server = await websockets.serve(
+            self.handle_connection,
+            self.settings.host,
+            self.settings.port,
+            max_size=None,
+            ping_interval=self.settings.websocket_ping_interval,
+            ping_timeout=self.settings.websocket_ping_timeout,
+        )
+
+    async def stop(self) -> None:
+        if self._server is None:
+            return
+
+        self._server.close()
+
+        await self._server.wait_closed()
+
+    async def handle_connection(
+        self,
+        websocket: WebSocketServerProtocol,
+    ) -> None:
+        self._active_connections.add(websocket)
+
+        remote = "unknown"
+
+        if websocket.remote_address:
+            remote = (
+                f"{websocket.remote_address[0]}:"
+                f"{websocket.remote_address[1]}"
+            )
+
+        logger.info(
+            "freeswitch_connection_opened",
+            remote_address=remote,
+        )
+
+        handler = FreeSwitchConnectionHandler(
+            websocket=websocket,
+        )
+
+        try:
+            await handler.run()
+
+        except websockets.ConnectionClosed:
+            logger.info(
+                "freeswitch_connection_closed",
+                remote_address=remote,
+            )
+
+        except Exception:
+            logger.exception(
+                "freeswitch_connection_error",
+                remote_address=remote,
+            )
+
+        finally:
+            self._active_connections.discard(websocket)
+```
+
+--------------------------------------------------
+File: src/api/health.py
+--------------------------------------------------
+
+```python
+from __future__ import annotations
+
+from aiohttp import web
+
+
+async def healthz(_: web.Request) -> web.Response:
+    return web.json_response(
+        {
+            "status": "ok",
+        }
+    )
+```
+
+--------------------------------------------------
+File: .env.example
+--------------------------------------------------
+
+```env
+APP_NAME=minicpm-freeswitch-agent
+
+ENVIRONMENT=development
+
+LOG_LEVEL=INFO
+
+HOST=0.0.0.0
+PORT=8765
+
+METRICS_HOST=0.0.0.0
+METRICS_PORT=9000
+
+MINICPM_WS_URL=wss://api.minicpm.example/realtime
+
+MINICPM_API_KEY=replace_me
+
+AUDIO_SAMPLE_RATE=16000
+
+AUDIO_CHANNELS=1
+
+AUDIO_CHUNK_MS=20
+
+VAD_AGGRESSIVENESS=2
+
+INTERRUPT_SPEECH_MS=240
+```
+
+--------------------------------------------------
+File: README.md
+--------------------------------------------------
+
+```md
+# MiniCPM FreeSWITCH Voice Agent
+
+Production-style realtime duplex voice agent using:
+
+- FreeSWITCH
+- mod_audio_stream
+- MiniCPM-o 4.5
+- Python asyncio
+- WebSockets
+- PCM16 streaming
+
+---
+
+## Features
+
+- Full duplex audio
+- Voice interruption (barge-in)
+- Structured logging
+- Prometheus metrics
+- Async streaming architecture
+- Production-oriented session isolation
+- Binary PCM transport
+- VAD-based interruption detection
+
+---
+
+## Audio Format
+
+Recommended:
+
+- PCM16
+- 16kHz
+- mono
+
+---
+
+## Run
+
+```bash
+python -m venv .venv
+
+source .venv/bin/activate
+
+pip install -e .
+
+cp .env.example .env
+
+python src/main.py
+```
+
+---
+
+## Metrics
+
+Prometheus metrics:
+
+```text
+http://localhost:9000
+```
+
+---
+
+## FreeSWITCH
+
+mod_audio_stream should stream:
+
+- raw binary websocket frames
+- PCM16 audio
+
+to:
+
+```text
+ws://YOUR_SERVER:8765
+```
+```
+
+At this point you now have:
+
+- runnable async server
+- websocket audio ingress
+- realtime MiniCPM client
+- duplex audio pipeline
+- VAD interruption detection
+- generation-based stale audio protection
+- structured logging
+- metrics
+- session lifecycle management
+
+The next production-critical stage would be:
+
+1. outbound pacing
+2. playback queue draining
+3. reconnect logic
+4. websocket heartbeat validation
+5. idle timeout handling
+6. backpressure management
+7. session-level cancellation propagation
+8. audio timing synchronization
+9. FreeSWITCH playback recovery
+10. observability/tracing
+
+Those are what separate “works in demo” from “survives production.”
+
+-------------------------------------------
+
+File: src/audio/audio_clock.py
+
+```python
+from __future__ import annotations
+
+import asyncio
+import time
+
+
+class AudioClock:
+    """
+    Maintains realtime pacing for outbound audio.
+
+    Without pacing:
+    - audio bursts
+    - websocket flooding
+    - playback distortion
+    - FreeSWITCH jitter
+
+    This is critical for production stability.
+    """
+
+    def __init__(
+        self,
+        sample_rate: int,
+        channels: int,
+        bytes_per_sample: int = 2,
+    ) -> None:
+        self.sample_rate = sample_rate
+        self.channels = channels
+        self.bytes_per_sample = bytes_per_sample
+
+        self.stream_time_seconds = 0.0
+
+        self.started_at = time.monotonic()
+
+    async def pace(self, pcm: bytes) -> None:
+        frame_duration = (
+            len(pcm)
+            / (
+                self.sample_rate
+                * self.channels
+                * self.bytes_per_sample
+            )
+        )
+
+        self.stream_time_seconds += frame_duration
+
+        elapsed = time.monotonic() - self.started_at
+
+        delay = self.stream_time_seconds - elapsed
+
+        if delay > 0:
+            await asyncio.sleep(delay)
+```
+
+--------------------------------------------------
+File: src/audio/frame.py
+--------------------------------------------------
+
+```python
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+
+@dataclass(slots=True)
+class PCMFrame:
+    audio: bytes
+
+    sample_rate: int
+
+    channels: int
+
+    timestamp_ms: int | None = None
+```
+
+--------------------------------------------------
+UPDATED FILE: src/audio/playback_buffer.py
+--------------------------------------------------
+
+Replace file with:
+
+```python
+from __future__ import annotations
+
+import asyncio
+
+from ai.protocol import OutboundAudioFrame
+
+
+class PlaybackBuffer:
+    """
+    Generation-aware playback queue.
+
+    Old generations are discarded after interruption.
+    """
+
+    def __init__(
+        self,
+        maxsize: int = 256,
+    ) -> None:
+        self.queue: asyncio.Queue[OutboundAudioFrame] = asyncio.Queue(
+            maxsize=maxsize
+        )
+
+    async def put(
+        self,
+        frame: OutboundAudioFrame,
+    ) -> None:
+        await self.queue.put(frame)
+
+    async def get(self) -> OutboundAudioFrame:
+        return await self.queue.get()
+
+    def clear_stale(
+        self,
+        active_generation_id: int,
+    ) -> int:
+        retained: list[OutboundAudioFrame] = []
+
+        dropped = 0
+
+        while not self.queue.empty():
+            frame = self.queue.get_nowait()
+
+            if frame.generation_id == active_generation_id:
+                retained.append(frame)
+            else:
+                dropped += 1
+
+        for frame in retained:
+            self.queue.put_nowait(frame)
+
+        return dropped
+```
+
+--------------------------------------------------
+UPDATED FILE: src/session/call_session.py
+--------------------------------------------------
+
+Replace entire file with:
+
+```python
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import time
+from uuid import uuid4
+
+import structlog
+from websockets.server import WebSocketServerProtocol
+
+from ai.minicpm_client import MiniCPMClient
+from ai.protocol import OutboundAudioFrame
+from audio.audio_clock import AudioClock
+from audio.playback_buffer import PlaybackBuffer
+from audio.vad import VoiceActivityDetector
+from config.settings import get_settings
+from infra.metrics import ACTIVE_CALLS
+from infra.metrics import AUDIO_IN_BYTES
+from infra.metrics import AUDIO_OUT_BYTES
+from infra.metrics import INTERRUPT_COUNT
+from infra.metrics import SESSION_DURATION
+from session.state import CallState
+
+logger = structlog.get_logger(__name__)
+
+
+class CallSession:
+    def __init__(
+        self,
+        websocket: WebSocketServerProtocol,
+    ) -> None:
+        self.settings = get_settings()
+
+        self.session_id = str(uuid4())
+
+        self.websocket = websocket
+
+        self.state = CallState.INITIALIZING
+
+        self.created_at = time.monotonic()
+
+        self.closed = False
+
+        self.inbound_audio_queue: asyncio.Queue[bytes] = asyncio.Queue(
+            maxsize=self.settings.inbound_audio_queue_size
+        )
+
+        self.outbound_audio_queue: asyncio.Queue[OutboundAudioFrame] = asyncio.Queue(
+            maxsize=self.settings.outbound_audio_queue_size
+        )
+
+        self.playback_buffer = PlaybackBuffer()
+
+        self.vad = VoiceActivityDetector()
+
+        self.audio_clock = AudioClock(
+            sample_rate=self.settings.audio_sample_rate,
+            channels=self.settings.audio_channels,
+        )
+
+        self.minicpm = MiniCPMClient(
+            session_id=self.session_id,
+            outbound_audio_queue=self.outbound_audio_queue,
+        )
+
+        self.tasks: list[asyncio.Task] = []
+
+        self.current_generation_id = 0
+
+        self.consecutive_speech_frames = 0
+
+        self.last_audio_at = time.monotonic()
+
+    async def start(self) -> None:
+        ACTIVE_CALLS.inc()
+
+        logger.info(
+            "call_session_starting",
+            session_id=self.session_id,
+        )
+
+        await self.minicpm.connect()
+
+        self.state = CallState.ACTIVE
+
+        self.tasks.extend(
+            [
+                asyncio.create_task(
+                    self._inbound_audio_loop(),
+                    name=f"inbound-audio-{self.session_id}",
+                ),
+                asyncio.create_task(
+                    self._outbound_audio_loop(),
+                    name=f"outbound-audio-{self.session_id}",
+                ),
+                asyncio.create_task(
+                    self._idle_watchdog_loop(),
+                    name=f"idle-watchdog-{self.session_id}",
+                ),
+            ]
+        )
+
+        logger.info(
+            "call_session_started",
+            session_id=self.session_id,
+        )
+
+    async def close(self) -> None:
+        if self.closed:
+            return
+
+        self.closed = True
+
+        self.state = CallState.CLOSING
+
+        logger.info(
+            "call_session_closing",
+            session_id=self.session_id,
+        )
+
+        for task in self.tasks:
+            task.cancel()
+
+        for task in self.tasks:
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+        await self.minicpm.close()
+
+        duration = time.monotonic() - self.created_at
+
+        SESSION_DURATION.observe(duration)
+
+        ACTIVE_CALLS.dec()
+
+        self.state = CallState.CLOSED
+
+        logger.info(
+            "call_session_closed",
+            session_id=self.session_id,
+            duration_seconds=round(duration, 2),
+        )
+
+    async def receive_audio(
+        self,
+        pcm: bytes,
+    ) -> None:
+        self.last_audio_at = time.monotonic()
+
+        AUDIO_IN_BYTES.inc(len(pcm))
+
+        try:
+            self.inbound_audio_queue.put_nowait(pcm)
+
+        except asyncio.QueueFull:
+            logger.warning(
+                "inbound_audio_queue_full",
+                session_id=self.session_id,
+            )
+
+    async def _inbound_audio_loop(self) -> None:
+        while True:
+            pcm = await self.inbound_audio_queue.get()
+
+            speech = self.vad.is_speech(pcm)
+
+            if speech:
+                self.consecutive_speech_frames += 1
+            else:
+                self.consecutive_speech_frames = 0
+
+            required_frames = (
+                self.settings.interrupt_speech_ms
+                // self.settings.audio_chunk_ms
+            )
+
+            if self.consecutive_speech_frames >= required_frames:
+                await self._handle_interrupt()
+
+            await self.minicpm.send_audio(pcm)
+
+    async def _outbound_audio_loop(self) -> None:
+        while True:
+            frame = await self.outbound_audio_queue.get()
+
+            if frame.generation_id != self.minicpm.current_generation_id:
+                logger.debug(
+                    "dropping_stale_audio",
+                    session_id=self.session_id,
+                    generation_id=frame.generation_id,
+                )
+                continue
+
+            AUDIO_OUT_BYTES.inc(len(frame.audio))
+
+            await self.audio_clock.pace(frame.audio)
+
+            await self.websocket.send(frame.audio)
+
+    async def _handle_interrupt(self) -> None:
+        self.consecutive_speech_frames = 0
+
+        INTERRUPT_COUNT.inc()
+
+        logger.info(
+            "interrupt_detected",
+            session_id=self.session_id,
+        )
+
+        generation_id = await self.minicpm.interrupt()
+
+        self.current_generation_id = generation_id
+
+        dropped = self.playback_buffer.clear_stale(
+            active_generation_id=generation_id
+        )
+
+        logger.info(
+            "playback_buffer_cleared",
+            session_id=self.session_id,
+            dropped_frames=dropped,
+        )
+
+    async def _idle_watchdog_loop(self) -> None:
+        while True:
+            await asyncio.sleep(5)
+
+            idle_seconds = (
+                time.monotonic() - self.last_audio_at
+            )
+
+            if (
+                idle_seconds
+                > self.settings.session_idle_timeout_seconds
+            ):
+                logger.info(
+                    "session_idle_timeout",
+                    session_id=self.session_id,
+                    idle_seconds=round(idle_seconds, 2),
+                )
+
+                await self.websocket.close()
+
+                return
+```
+
+--------------------------------------------------
+UPDATED FILE: src/ai/minicpm_client.py
+--------------------------------------------------
+
+Replace file with:
+
+```python
+from __future__ import annotations
+
+import asyncio
+import base64
+import contextlib
+import time
+
+import orjson
+import structlog
+import websockets
+
+from ai.protocol import MiniCPMMessageType
+from ai.protocol import OutboundAudioFrame
+from config.settings import get_settings
+
+logger = structlog.get_logger(__name__)
+
+
+class MiniCPMClient:
+    def __init__(
+        self,
+        session_id: str,
+        outbound_audio_queue: asyncio.Queue[OutboundAudioFrame],
+    ) -> None:
+        self.settings = get_settings()
+
+        self.session_id = session_id
+
+        self.outbound_audio_queue = outbound_audio_queue
+
+        self.websocket: websockets.WebSocketClientProtocol | None = None
+
+        self.read_task: asyncio.Task | None = None
+
+        self.heartbeat_task: asyncio.Task | None = None
+
+        self.connected = False
+
+        self.current_generation_id = 0
+
+        self._write_lock = asyncio.Lock()
+
+        self.last_server_activity = time.monotonic()
+
+    async def connect(self) -> None:
+        logger.info(
+            "minicpm_connecting",
+            session_id=self.session_id,
+        )
+
+        headers = {
+            "Authorization": f"Bearer {self.settings.minicpm_api_key}",
+        }
+
+        self.websocket = await websockets.connect(
+            self.settings.minicpm_ws_url,
+            extra_headers=headers,
+            max_size=None,
+            ping_interval=self.settings.websocket_ping_interval,
+            ping_timeout=self.settings.websocket_ping_timeout,
+            open_timeout=self.settings.minicpm_connect_timeout_seconds,
+        )
+
+        self.connected = True
+
+        self.read_task = asyncio.create_task(
+            self._reader_loop(),
+            name=f"minicpm-reader-{self.session_id}",
+        )
+
+        self.heartbeat_task = asyncio.create_task(
+            self._heartbeat_loop(),
+            name=f"minicpm-heartbeat-{self.session_id}",
+        )
+
+        logger.info(
+            "minicpm_connected",
+            session_id=self.session_id,
+        )
+
+    async def close(self) -> None:
+        self.connected = False
+
+        tasks = [
+            self.read_task,
+            self.heartbeat_task,
+        ]
+
+        for task in tasks:
+            if task:
+                task.cancel()
+
+        for task in tasks:
+            if task:
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+
+        if self.websocket:
+            await self.websocket.close()
+
+        logger.info(
+            "minicpm_closed",
+            session_id=self.session_id,
+        )
+
+    async def send_audio(
+        self,
+        pcm: bytes,
+    ) -> None:
+        if not self.websocket:
+            raise RuntimeError("MiniCPM websocket not connected")
+
+        payload = {
+            "type": MiniCPMMessageType.INPUT_AUDIO_BUFFER_APPEND.value,
+            "audio": base64.b64encode(pcm).decode(),
+        }
+
+        async with self._write_lock:
+            await self.websocket.send(
+                orjson.dumps(payload).decode()
+            )
+
+    async def interrupt(self) -> int:
+        if not self.websocket:
+            return self.current_generation_id
+
+        self.current_generation_id += 1
+
+        generation_id = self.current_generation_id
+
+        payload = {
+            "type": MiniCPMMessageType.INTERRUPT.value,
+        }
+
+        logger.info(
+            "sending_interrupt",
+            session_id=self.session_id,
+            generation_id=generation_id,
+        )
+
+        async with self._write_lock:
+            await self.websocket.send(
+                orjson.dumps(payload).decode()
+            )
+
+        return generation_id
+
+    async def _reader_loop(self) -> None:
+        assert self.websocket is not None
+
+        async for raw_message in self.websocket:
+            self.last_server_activity = time.monotonic()
+
+            try:
+                if isinstance(raw_message, bytes):
+                    continue
+
+                message = orjson.loads(raw_message)
+
+                await self._handle_message(message)
+
+            except Exception:
+                logger.exception(
+                    "minicpm_reader_error",
+                    session_id=self.session_id,
+                )
+
+    async def _handle_message(
+        self,
+        message: dict,
+    ) -> None:
+        message_type = message.get("type")
+
+        if (
+            message_type
+            == MiniCPMMessageType.RESPONSE_STARTED.value
+        ):
+            self.current_generation_id += 1
+
+            logger.info(
+                "response_started",
+                session_id=self.session_id,
+                generation_id=self.current_generation_id,
+            )
+
+            return
+
+        if (
+            message_type
+            == MiniCPMMessageType.RESPONSE_AUDIO_DELTA.value
+        ):
+            audio_b64 = message.get("audio")
+
+            if not audio_b64:
+                return
+
+            pcm = base64.b64decode(audio_b64)
+
+            frame = OutboundAudioFrame(
+                generation_id=self.current_generation_id,
+                audio=pcm,
+            )
+
+            try:
+                self.outbound_audio_queue.put_nowait(frame)
+
+            except asyncio.QueueFull:
+                logger.warning(
+                    "outbound_audio_queue_full",
+                    session_id=self.session_id,
+                )
+
+            return
+
+        if (
+            message_type
+            == MiniCPMMessageType.RESPONSE_DONE.value
+        ):
+            logger.info(
+                "response_done",
+                session_id=self.session_id,
+                generation_id=self.current_generation_id,
+            )
+
+            return
+
+        if message_type == MiniCPMMessageType.ERROR.value:
+            logger.error(
+                "minicpm_error",
+                session_id=self.session_id,
+                payload=message,
+            )
+
+            return
+
+    async def _heartbeat_loop(self) -> None:
+        while True:
+            await asyncio.sleep(10)
+
+            idle = (
+                time.monotonic()
+                - self.last_server_activity
+            )
+
+            if idle > 60:
+                logger.warning(
+                    "minicpm_server_idle",
+                    session_id=self.session_id,
+                    idle_seconds=round(idle, 2),
+                )
+```
+
+File: src/infra/errors.py
+
+```python
+from __future__ import annotations
+
+
+class SessionError(Exception):
+    pass
+
+
+class MiniCPMConnectionError(SessionError):
+    pass
+
+
+class AudioPipelineError(SessionError):
+    pass
+
+
+class BackpressureError(SessionError):
+    pass
+```
+
+--------------------------------------------------
+File: src/infra/task_manager.py
+--------------------------------------------------
+
+```python
+from __future__ import annotations
+
+import asyncio
+import contextlib
+
+import structlog
+
+logger = structlog.get_logger(__name__)
+
+
+class TaskManager:
+    """
+    Structured task lifecycle management.
+
+    Prevents:
+    - orphaned tasks
+    - silent task crashes
+    - cancellation leaks
+    """
+
+    def __init__(self) -> None:
+        self.tasks: set[asyncio.Task] = set()
+
+    def create_task(
+        self,
+        coro,
+        name: str,
+    ) -> asyncio.Task:
+        task = asyncio.create_task(
+            coro,
+            name=name,
+        )
+
+        task.add_done_callback(self._on_task_done)
+
+        self.tasks.add(task)
+
+        return task
+
+    async def cancel_all(self) -> None:
+        for task in self.tasks:
+            task.cancel()
+
+        for task in self.tasks:
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+        self.tasks.clear()
+
+    def _on_task_done(
+        self,
+        task: asyncio.Task,
+    ) -> None:
+        self.tasks.discard(task)
+
+        try:
+            exc = task.exception()
+
+            if exc:
+                logger.exception(
+                    "task_crashed",
+                    task_name=task.get_name(),
+                    error=str(exc),
+                )
+
+        except asyncio.CancelledError:
+            pass
+```
+
+--------------------------------------------------
+File: src/audio/ring_buffer.py
+--------------------------------------------------
+
+```python
+from __future__ import annotations
+
+from collections import deque
+
+
+class AudioRingBuffer:
+    """
+    Small rolling audio history buffer.
+
+    Useful for:
+    - interruption recovery
+    - context replay
+    - future wake-word support
+    """
+
+    def __init__(
+        self,
+        max_frames: int = 50,
+    ) -> None:
+        self.frames: deque[bytes] = deque(
+            maxlen=max_frames
+        )
+
+    def append(
+        self,
+        pcm: bytes,
+    ) -> None:
+        self.frames.append(pcm)
+
+    def clear(self) -> None:
+        self.frames.clear()
+
+    def dump(self) -> bytes:
+        return b"".join(self.frames)
+```
+
+--------------------------------------------------
+File: src/audio/energy.py
+--------------------------------------------------
+
+```python
+from __future__ import annotations
+
+import audioop
+
+
+def calculate_rms(
+    pcm: bytes,
+) -> float:
+    return float(audioop.rms(pcm, 2))
+
+
+def is_above_threshold(
+    pcm: bytes,
+    threshold: float,
+) -> bool:
+    rms = calculate_rms(pcm)
+
+    return rms >= threshold
+```
+
+--------------------------------------------------
+UPDATED FILE: src/config/settings.py
+--------------------------------------------------
+
+Add these fields inside Settings:
+
+```python
+    vad_energy_threshold: float = 250.0
+
+    playback_frame_ms: int = 20
+
+    websocket_write_limit: int = 2**20
+
+    websocket_max_queue: int = 64
+
+    enable_audio_pacing: bool = True
+
+    max_interrupts_per_second: float = 3.0
+```
+
+--------------------------------------------------
+UPDATED FILE: src/audio/vad.py
+--------------------------------------------------
+
+Replace file with:
+
+```python
+from __future__ import annotations
+
+import webrtcvad
+
+from audio.energy import is_above_threshold
+from config.settings import get_settings
+
+
+class VoiceActivityDetector:
+    """
+    Hybrid VAD:
+    - WebRTC VAD
+    - RMS energy gate
+
+    Prevents:
+    - breathing false positives
+    - echo-triggered interrupts
+    - low-level noise interruptions
+    """
+
+    def __init__(self) -> None:
+        settings = get_settings()
+
+        self.sample_rate = settings.audio_sample_rate
+
+        self.frame_ms = settings.vad_frame_ms
+
+        self.energy_threshold = settings.vad_energy_threshold
+
+        self.vad = webrtcvad.Vad(
+            settings.vad_aggressiveness
+        )
+
+    def is_speech(
+        self,
+        pcm: bytes,
+    ) -> bool:
+        if not is_above_threshold(
+            pcm,
+            self.energy_threshold,
+        ):
+            return False
+
+        return self.vad.is_speech(
+            pcm,
+            self.sample_rate,
+        )
+```
+
+--------------------------------------------------
+UPDATED FILE: src/freeswitch/ws_server.py
+--------------------------------------------------
+
+Replace file with:
+
+```python
+from __future__ import annotations
+
+import asyncio
+
+import structlog
+import websockets
+from websockets.server import WebSocketServerProtocol
+
+from config.settings import get_settings
+from freeswitch.connection import FreeSwitchConnectionHandler
+
+logger = structlog.get_logger(__name__)
+
+
+class FreeSwitchAudioServer:
+    def __init__(self) -> None:
+        self.settings = get_settings()
+
+        self._server: websockets.WebSocketServer | None = None
+
+        self._active_connections: set[
+            WebSocketServerProtocol
+        ] = set()
+
+        self._connection_semaphore = asyncio.Semaphore(
+            self.settings.max_concurrent_sessions
+        )
+
+    async def start(self) -> None:
+        self._server = await websockets.serve(
+            self.handle_connection,
+            self.settings.host,
+            self.settings.port,
+            max_size=None,
+            max_queue=self.settings.websocket_max_queue,
+            write_limit=self.settings.websocket_write_limit,
+            ping_interval=self.settings.websocket_ping_interval,
+            ping_timeout=self.settings.websocket_ping_timeout,
+        )
+
+    async def stop(self) -> None:
+        if self._server is None:
+            return
+
+        self._server.close()
+
+        await self._server.wait_closed()
+
+    async def handle_connection(
+        self,
+        websocket: WebSocketServerProtocol,
+    ) -> None:
+        async with self._connection_semaphore:
+            await self._handle_connection_impl(
+                websocket
+            )
+
+    async def _handle_connection_impl(
+        self,
+        websocket: WebSocketServerProtocol,
+    ) -> None:
+        self._active_connections.add(websocket)
+
+        remote = "unknown"
+
+        if websocket.remote_address:
+            remote = (
+                f"{websocket.remote_address[0]}:"
+                f"{websocket.remote_address[1]}"
+            )
+
+        logger.info(
+            "freeswitch_connection_opened",
+            remote_address=remote,
+            active_connections=len(
+                self._active_connections
+            ),
+        )
+
+        handler = FreeSwitchConnectionHandler(
+            websocket=websocket,
+        )
+
+        try:
+            await handler.run()
+
+        except websockets.ConnectionClosed:
+            logger.info(
+                "freeswitch_connection_closed",
+                remote_address=remote,
+            )
+
+        except Exception:
+            logger.exception(
+                "freeswitch_connection_error",
+                remote_address=remote,
+            )
+
+        finally:
+            self._active_connections.discard(
+                websocket
+            )
+```
+
+--------------------------------------------------
+UPDATED FILE: src/session/call_session.py
+--------------------------------------------------
+
+Replace entire file with:
+
+```python
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import time
+from uuid import uuid4
+
+import structlog
+from websockets.server import WebSocketServerProtocol
+
+from ai.minicpm_client import MiniCPMClient
+from ai.protocol import OutboundAudioFrame
+from audio.audio_clock import AudioClock
+from audio.playback_buffer import PlaybackBuffer
+from audio.ring_buffer import AudioRingBuffer
+from audio.vad import VoiceActivityDetector
+from config.settings import get_settings
+from infra.metrics import ACTIVE_CALLS
+from infra.metrics import AUDIO_IN_BYTES
+from infra.metrics import AUDIO_OUT_BYTES
+from infra.metrics import INTERRUPT_COUNT
+from infra.metrics import SESSION_DURATION
+from infra.task_manager import TaskManager
+from session.state import CallState
+
+logger = structlog.get_logger(__name__)
+
+
+class CallSession:
+    def __init__(
+        self,
+        websocket: WebSocketServerProtocol,
+    ) -> None:
+        self.settings = get_settings()
+
+        self.session_id = str(uuid4())
+
+        self.websocket = websocket
+
+        self.state = CallState.INITIALIZING
+
+        self.created_at = time.monotonic()
+
+        self.closed = False
+
+        self.inbound_audio_queue: asyncio.Queue[bytes] = asyncio.Queue(
+            maxsize=self.settings.inbound_audio_queue_size
+        )
+
+        self.outbound_audio_queue: asyncio.Queue[
+            OutboundAudioFrame
+        ] = asyncio.Queue(
+            maxsize=self.settings.outbound_audio_queue_size
+        )
+
+        self.playback_buffer = PlaybackBuffer()
+
+        self.audio_history = AudioRingBuffer()
+
+        self.vad = VoiceActivityDetector()
+
+        self.audio_clock = AudioClock(
+            sample_rate=self.settings.audio_sample_rate,
+            channels=self.settings.audio_channels,
+        )
+
+        self.minicpm = MiniCPMClient(
+            session_id=self.session_id,
+            outbound_audio_queue=self.outbound_audio_queue,
+        )
+
+        self.task_manager = TaskManager()
+
+        self.current_generation_id = 0
+
+        self.consecutive_speech_frames = 0
+
+        self.last_interrupt_at = 0.0
+
+        self.last_audio_at = time.monotonic()
+
+    async def start(self) -> None:
+        ACTIVE_CALLS.inc()
+
+        logger.info(
+            "call_session_starting",
+            session_id=self.session_id,
+        )
+
+        await self.minicpm.connect()
+
+        self.state = CallState.ACTIVE
+
+        self.task_manager.create_task(
+            self._inbound_audio_loop(),
+            name=f"inbound-audio-{self.session_id}",
+        )
+
+        self.task_manager.create_task(
+            self._outbound_audio_loop(),
+            name=f"outbound-audio-{self.session_id}",
+        )
+
+        self.task_manager.create_task(
+            self._idle_watchdog_loop(),
+            name=f"idle-watchdog-{self.session_id}",
+        )
+
+        logger.info(
+            "call_session_started",
+            session_id=self.session_id,
+        )
+
+    async def close(self) -> None:
+        if self.closed:
+            return
+
+        self.closed = True
+
+        self.state = CallState.CLOSING
+
+        logger.info(
+            "call_session_closing",
+            session_id=self.session_id,
+        )
+
+        await self.task_manager.cancel_all()
+
+        await self.minicpm.close()
+
+        duration = (
+            time.monotonic() - self.created_at
+        )
+
+        SESSION_DURATION.observe(duration)
+
+        ACTIVE_CALLS.dec()
+
+        self.state = CallState.CLOSED
+
+        logger.info(
+            "call_session_closed",
+            session_id=self.session_id,
+            duration_seconds=round(duration, 2),
+        )
+
+    async def receive_audio(
+        self,
+        pcm: bytes,
+    ) -> None:
+        self.last_audio_at = time.monotonic()
+
+        AUDIO_IN_BYTES.inc(len(pcm))
+
+        self.audio_history.append(pcm)
+
+        try:
+            self.inbound_audio_queue.put_nowait(
+                pcm
+            )
+
+        except asyncio.QueueFull:
+            logger.warning(
+                "inbound_audio_queue_full",
+                session_id=self.session_id,
+            )
+
+    async def _inbound_audio_loop(self) -> None:
+        while True:
+            pcm = await self.inbound_audio_queue.get()
+
+            speech = self.vad.is_speech(pcm)
+
+            if speech:
+                self.consecutive_speech_frames += 1
+            else:
+                self.consecutive_speech_frames = 0
+
+            required_frames = (
+                self.settings.interrupt_speech_ms
+                // self.settings.audio_chunk_ms
+            )
+
+            if (
+                self.consecutive_speech_frames
+                >= required_frames
+            ):
+                await self._handle_interrupt()
+
+            await self.minicpm.send_audio(pcm)
+
+    async def _outbound_audio_loop(self) -> None:
+        while True:
+            frame = (
+                await self.outbound_audio_queue.get()
+            )
+
+            if (
+                frame.generation_id
+                != self.minicpm.current_generation_id
+            ):
+                logger.debug(
+                    "dropping_stale_audio",
+                    session_id=self.session_id,
+                    generation_id=frame.generation_id,
+                )
+
+                continue
+
+            AUDIO_OUT_BYTES.inc(len(frame.audio))
+
+            if self.settings.enable_audio_pacing:
+                await self.audio_clock.pace(
+                    frame.audio
+                )
+
+            try:
+                await self.websocket.send(
+                    frame.audio
+                )
+
+            except Exception:
+                logger.exception(
+                    "outbound_audio_send_failed",
+                    session_id=self.session_id,
+                )
+
+                raise
+
+    async def _handle_interrupt(self) -> None:
+        now = time.monotonic()
+
+        delta = now - self.last_interrupt_at
+
+        if (
+            delta > 0
+            and (1 / delta)
+            > self.settings.max_interrupts_per_second
+        ):
+            return
+
+        self.last_interrupt_at = now
+
+        self.consecutive_speech_frames = 0
+
+        INTERRUPT_COUNT.inc()
+
+        logger.info(
+            "interrupt_detected",
+            session_id=self.session_id,
+        )
+
+        generation_id = (
+            await self.minicpm.interrupt()
+        )
+
+        self.current_generation_id = (
+            generation_id
+        )
+
+        dropped = (
+            self.playback_buffer.clear_stale(
+                active_generation_id=(
+                    generation_id
+                )
+            )
+        )
+
+        logger.info(
+            "playback_buffer_cleared",
+            session_id=self.session_id,
+            dropped_frames=dropped,
+        )
+
+    async def _idle_watchdog_loop(self) -> None:
+        while True:
+            await asyncio.sleep(5)
+
+            idle_seconds = (
+                time.monotonic()
+                - self.last_audio_at
+            )
+
+            if (
+                idle_seconds
+                > self.settings.session_idle_timeout_seconds
+            ):
+                logger.info(
+                    "session_idle_timeout",
+                    session_id=self.session_id,
+                    idle_seconds=round(
+                        idle_seconds,
+                        2,
+                    ),
+                )
+
+                await self.websocket.close()
+
+                return
+```
+
+File: src/ai/reconnect.py
+
+```python
+from __future__ import annotations
+
+import asyncio
+import random
+
+
+class ExponentialBackoff:
+    def __init__(
+        self,
+        base_delay: float = 1.0,
+        max_delay: float = 20.0,
+        jitter: bool = True,
+    ) -> None:
+        self.base_delay = base_delay
+        self.max_delay = max_delay
+        self.jitter = jitter
+
+        self.attempt = 0
+
+    async def sleep(self) -> None:
+        delay = min(
+            self.base_delay * (2**self.attempt),
+            self.max_delay,
+        )
+
+        if self.jitter:
+            delay *= random.uniform(0.8, 1.2)
+
+        await asyncio.sleep(delay)
+
+        self.attempt += 1
+
+    def reset(self) -> None:
+        self.attempt = 0
+```
+
+--------------------------------------------------
+UPDATED FILE: src/infra/metrics.py
+--------------------------------------------------
+
+Replace file with:
+
+```python
+from prometheus_client import Counter
+from prometheus_client import Gauge
+from prometheus_client import Histogram
+
+ACTIVE_CALLS = Gauge(
+    "active_calls",
+    "Number of active call sessions",
+)
+
+ACTIVE_MINICPM_CONNECTIONS = Gauge(
+    "active_minicpm_connections",
+    "Active MiniCPM websocket connections",
+)
+
+AUDIO_IN_BYTES = Counter(
+    "audio_in_bytes_total",
+    "Inbound audio bytes",
+)
+
+AUDIO_OUT_BYTES = Counter(
+    "audio_out_bytes_total",
+    "Outbound audio bytes",
+)
+
+INTERRUPT_COUNT = Counter(
+    "interrupt_count_total",
+    "Number of user interruptions",
+)
+
+MINICPM_RECONNECTS = Counter(
+    "minicpm_reconnects_total",
+    "MiniCPM reconnect count",
+)
+
+OUTBOUND_QUEUE_DROPS = Counter(
+    "outbound_queue_drops_total",
+    "Dropped outbound audio frames",
+)
+
+INBOUND_QUEUE_DROPS = Counter(
+    "inbound_queue_drops_total",
+    "Dropped inbound audio frames",
+)
+
+SESSION_DURATION = Histogram(
+    "session_duration_seconds",
+    "Call session duration",
+)
+
+MINICPM_RESPONSE_LATENCY = Histogram(
+    "minicpm_response_latency_seconds",
+    "Latency from user audio to first AI audio",
+)
+```
+
+--------------------------------------------------
+UPDATED FILE: src/ai/minicpm_client.py
+--------------------------------------------------
+
+Replace entire file with:
+
+```python
+from __future__ import annotations
+
+import asyncio
+import base64
+import contextlib
+import time
+
+import orjson
+import structlog
+import websockets
+
+from ai.protocol import MiniCPMMessageType
+from ai.protocol import OutboundAudioFrame
+from ai.reconnect import ExponentialBackoff
+from config.settings import get_settings
+from infra.metrics import ACTIVE_MINICPM_CONNECTIONS
+from infra.metrics import MINICPM_RECONNECTS
+from infra.metrics import OUTBOUND_QUEUE_DROPS
+
+logger = structlog.get_logger(__name__)
+
+
+class MiniCPMClient:
+    """
+    Production realtime websocket client.
+
+    Handles:
+    - duplex audio
+    - reconnects
+    - heartbeats
+    - generation tracking
+    - queue protection
+    """
+
+    def __init__(
+        self,
+        session_id: str,
+        outbound_audio_queue: asyncio.Queue[OutboundAudioFrame],
+    ) -> None:
+        self.settings = get_settings()
+
+        self.session_id = session_id
+
+        self.outbound_audio_queue = outbound_audio_queue
+
+        self.websocket: (
+            websockets.WebSocketClientProtocol | None
+        ) = None
+
+        self.read_task: asyncio.Task | None = None
+
+        self.heartbeat_task: asyncio.Task | None = None
+
+        self.connected = False
+
+        self.closing = False
+
+        self.current_generation_id = 0
+
+        self._write_lock = asyncio.Lock()
+
+        self.last_server_activity = time.monotonic()
+
+        self.reconnect_backoff = ExponentialBackoff()
+
+    async def connect(self) -> None:
+        if self.connected:
+            return
+
+        logger.info(
+            "minicpm_connecting",
+            session_id=self.session_id,
+        )
+
+        headers = {
+            "Authorization": (
+                f"Bearer "
+                f"{self.settings.minicpm_api_key}"
+            ),
+        }
+
+        self.websocket = await websockets.connect(
+            self.settings.minicpm_ws_url,
+            extra_headers=headers,
+            max_size=None,
+            ping_interval=(
+                self.settings.websocket_ping_interval
+            ),
+            ping_timeout=(
+                self.settings.websocket_ping_timeout
+            ),
+            open_timeout=(
+                self.settings.minicpm_connect_timeout_seconds
+            ),
+        )
+
+        self.connected = True
+
+        ACTIVE_MINICPM_CONNECTIONS.inc()
+
+        self.read_task = asyncio.create_task(
+            self._reader_loop(),
+            name=f"minicpm-reader-{self.session_id}",
+        )
+
+        self.heartbeat_task = asyncio.create_task(
+            self._heartbeat_loop(),
+            name=f"minicpm-heartbeat-{self.session_id}",
+        )
+
+        logger.info(
+            "minicpm_connected",
+            session_id=self.session_id,
+        )
+
+    async def close(self) -> None:
+        self.closing = True
+
+        self.connected = False
+
+        tasks = [
+            self.read_task,
+            self.heartbeat_task,
+        ]
+
+        for task in tasks:
+            if task:
+                task.cancel()
+
+        for task in tasks:
+            if task:
+                with contextlib.suppress(
+                    asyncio.CancelledError
+                ):
+                    await task
+
+        if self.websocket:
+            await self.websocket.close()
+
+        ACTIVE_MINICPM_CONNECTIONS.dec()
+
+        logger.info(
+            "minicpm_closed",
+            session_id=self.session_id,
+        )
+
+    async def send_audio(
+        self,
+        pcm: bytes,
+    ) -> None:
+        await self._ensure_connection()
+
+        if not self.websocket:
+            return
+
+        payload = {
+            "type": (
+                MiniCPMMessageType
+                .INPUT_AUDIO_BUFFER_APPEND
+                .value
+            ),
+            "audio": (
+                base64.b64encode(pcm).decode()
+            ),
+        }
+
+        try:
+            async with self._write_lock:
+                await self.websocket.send(
+                    orjson.dumps(payload).decode()
+                )
+
+        except Exception:
+            logger.exception(
+                "minicpm_send_audio_failed",
+                session_id=self.session_id,
+            )
+
+            self.connected = False
+
+            raise
+
+    async def interrupt(self) -> int:
+        await self._ensure_connection()
+
+        if not self.websocket:
+            return self.current_generation_id
+
+        self.current_generation_id += 1
+
+        generation_id = (
+            self.current_generation_id
+        )
+
+        payload = {
+            "type": (
+                MiniCPMMessageType.INTERRUPT.value
+            ),
+        }
+
+        logger.info(
+            "sending_interrupt",
+            session_id=self.session_id,
+            generation_id=generation_id,
+        )
+
+        try:
+            async with self._write_lock:
+                await self.websocket.send(
+                    orjson.dumps(payload).decode()
+                )
+
+        except Exception:
+            logger.exception(
+                "interrupt_send_failed",
+                session_id=self.session_id,
+            )
+
+            self.connected = False
+
+        return generation_id
+
+    async def _ensure_connection(self) -> None:
+        if self.connected:
+            return
+
+        if self.closing:
+            return
+
+        while not self.connected:
+            try:
+                MINICPM_RECONNECTS.inc()
+
+                logger.warning(
+                    "minicpm_reconnecting",
+                    session_id=self.session_id,
+                )
+
+                await self.connect()
+
+                self.reconnect_backoff.reset()
+
+                logger.info(
+                    "minicpm_reconnected",
+                    session_id=self.session_id,
+                )
+
+                return
+
+            except Exception:
+                logger.exception(
+                    "minicpm_reconnect_failed",
+                    session_id=self.session_id,
+                )
+
+                await self.reconnect_backoff.sleep()
+
+    async def _reader_loop(self) -> None:
+        assert self.websocket is not None
+
+        try:
+            async for raw_message in self.websocket:
+                self.last_server_activity = (
+                    time.monotonic()
+                )
+
+                try:
+                    if isinstance(
+                        raw_message,
+                        bytes,
+                    ):
+                        continue
+
+                    message = orjson.loads(
+                        raw_message
+                    )
+
+                    await self._handle_message(
+                        message
+                    )
+
+                except Exception:
+                    logger.exception(
+                        "minicpm_reader_error",
+                        session_id=self.session_id,
+                    )
+
+        except Exception:
+            logger.exception(
+                "minicpm_reader_disconnected",
+                session_id=self.session_id,
+            )
+
+            self.connected = False
+
+    async def _handle_message(
+        self,
+        message: dict,
+    ) -> None:
+        message_type = message.get("type")
+
+        if (
+            message_type
+            == MiniCPMMessageType
+            .RESPONSE_STARTED
+            .value
+        ):
+            self.current_generation_id += 1
+
+            logger.info(
+                "response_started",
+                session_id=self.session_id,
+                generation_id=(
+                    self.current_generation_id
+                ),
+            )
+
+            return
+
+        if (
+            message_type
+            == MiniCPMMessageType
+            .RESPONSE_AUDIO_DELTA
+            .value
+        ):
+            audio_b64 = message.get("audio")
+
+            if not audio_b64:
+                return
+
+            pcm = base64.b64decode(
+                audio_b64
+            )
+
+            frame = OutboundAudioFrame(
+                generation_id=(
+                    self.current_generation_id
+                ),
+                audio=pcm,
+            )
+
+            try:
+                self.outbound_audio_queue.put_nowait(
+                    frame
+                )
+
+            except asyncio.QueueFull:
+                OUTBOUND_QUEUE_DROPS.inc()
+
+                logger.warning(
+                    "outbound_audio_queue_full",
+                    session_id=self.session_id,
+                )
+
+            return
+
+        if (
+            message_type
+            == MiniCPMMessageType
+            .RESPONSE_DONE
+            .value
+        ):
+            logger.info(
+                "response_done",
+                session_id=self.session_id,
+                generation_id=(
+                    self.current_generation_id
+                ),
+            )
+
+            return
+
+        if (
+            message_type
+            == MiniCPMMessageType.ERROR.value
+        ):
+            logger.error(
+                "minicpm_error",
+                session_id=self.session_id,
+                payload=message,
+            )
+
+    async def _heartbeat_loop(self) -> None:
+        while True:
+            await asyncio.sleep(10)
+
+            idle = (
+                time.monotonic()
+                - self.last_server_activity
+            )
+
+            if idle > 60:
+                logger.warning(
+                    "minicpm_server_idle",
+                    session_id=self.session_id,
+                    idle_seconds=round(idle, 2),
+                )
+
+                self.connected = False
+```
+
+File: src/audio/chunker.py
+
+```python
+from __future__ import annotations
+
+
+class PCMChunker:
+    """
+    Ensures stable PCM frame sizing.
+
+    Many realtime APIs behave poorly when:
+    - frame sizes vary
+    - chunks become too large
+    - websocket packet timing drifts
+
+    This normalizes stream chunking.
+    """
+
+    def __init__(
+        self,
+        sample_rate: int,
+        chunk_ms: int,
+        channels: int = 1,
+        bytes_per_sample: int = 2,
+    ) -> None:
+        self.sample_rate = sample_rate
+
+        self.chunk_ms = chunk_ms
+
+        self.channels = channels
+
+        self.bytes_per_sample = bytes_per_sample
+
+        self.chunk_size = int(
+            (
+                self.sample_rate
+                * self.chunk_ms
+                / 1000
+            )
+            * self.channels
+            * self.bytes_per_sample
+        )
+
+        self.buffer = bytearray()
+
+    def append(
+        self,
+        pcm: bytes,
+    ) -> list[bytes]:
+        self.buffer.extend(pcm)
+
+        chunks: list[bytes] = []
+
+        while len(self.buffer) >= self.chunk_size:
+            chunk = bytes(
+                self.buffer[: self.chunk_size]
+            )
+
+            del self.buffer[: self.chunk_size]
+
+            chunks.append(chunk)
+
+        return chunks
+
+    def flush(self) -> bytes:
+        if not self.buffer:
+            return b""
+
+        remaining = bytes(self.buffer)
+
+        self.buffer.clear()
+
+        return remaining
+```
+
+--------------------------------------------------
+File: src/audio/silence.py
+--------------------------------------------------
+
+```python
+from __future__ import annotations
+
+import audioop
+
+
+class SilenceDetector:
+    """
+    Detects sustained silence.
+
+    Useful for:
+    - turn commit
+    - endpointing
+    - idle reduction
+    """
+
+    def __init__(
+        self,
+        threshold: float = 150.0,
+    ) -> None:
+        self.threshold = threshold
+
+    def is_silence(
+        self,
+        pcm: bytes,
+    ) -> bool:
+        rms = audioop.rms(pcm, 2)
+
+        return rms < self.threshold
+```
+
+--------------------------------------------------
+UPDATED FILE: src/config/settings.py
+--------------------------------------------------
+
+Add these fields:
+
+```python
+    silence_commit_ms: int = 900
+
+    silence_rms_threshold: float = 150.0
+
+    minicpm_auto_commit_audio: bool = True
+
+    minicpm_commit_interval_ms: int = 1000
+```
+
+--------------------------------------------------
+UPDATED FILE: src/session/call_session.py
+--------------------------------------------------
+
+Replace entire file with:
+
+```python
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import time
+from uuid import uuid4
+
+import structlog
+from websockets.server import WebSocketServerProtocol
+
+from ai.minicpm_client import MiniCPMClient
+from ai.protocol import OutboundAudioFrame
+from audio.audio_clock import AudioClock
+from audio.chunker import PCMChunker
+from audio.playback_buffer import PlaybackBuffer
+from audio.ring_buffer import AudioRingBuffer
+from audio.silence import SilenceDetector
+from audio.vad import VoiceActivityDetector
+from config.settings import get_settings
+from infra.metrics import ACTIVE_CALLS
+from infra.metrics import AUDIO_IN_BYTES
+from infra.metrics import AUDIO_OUT_BYTES
+from infra.metrics import INBOUND_QUEUE_DROPS
+from infra.metrics import INTERRUPT_COUNT
+from infra.metrics import SESSION_DURATION
+from infra.task_manager import TaskManager
+from session.state import CallState
+
+logger = structlog.get_logger(__name__)
+
+
+class CallSession:
+    """
+    Core realtime duplex orchestration.
+
+    Responsibilities:
+    - ingest caller audio
+    - VAD + interruption
+    - stream audio to MiniCPM
+    - playback AI audio
+    - pacing
+    - endpoint detection
+    - lifecycle management
+    """
+
+    def __init__(
+        self,
+        websocket: WebSocketServerProtocol,
+    ) -> None:
+        self.settings = get_settings()
+
+        self.session_id = str(uuid4())
+
+        self.websocket = websocket
+
+        self.state = CallState.INITIALIZING
+
+        self.created_at = time.monotonic()
+
+        self.closed = False
+
+        self.inbound_audio_queue: asyncio.Queue[bytes] = asyncio.Queue(
+            maxsize=self.settings.inbound_audio_queue_size
+        )
+
+        self.outbound_audio_queue: asyncio.Queue[
+            OutboundAudioFrame
+        ] = asyncio.Queue(
+            maxsize=self.settings.outbound_audio_queue_size
+        )
+
+        self.playback_buffer = PlaybackBuffer()
+
+        self.audio_history = AudioRingBuffer()
+
+        self.vad = VoiceActivityDetector()
+
+        self.silence_detector = SilenceDetector(
+            threshold=self.settings.silence_rms_threshold
+        )
+
+        self.audio_clock = AudioClock(
+            sample_rate=self.settings.audio_sample_rate,
+            channels=self.settings.audio_channels,
+        )
+
+        self.chunker = PCMChunker(
+            sample_rate=self.settings.audio_sample_rate,
+            chunk_ms=self.settings.audio_chunk_ms,
+            channels=self.settings.audio_channels,
+        )
+
+        self.minicpm = MiniCPMClient(
+            session_id=self.session_id,
+            outbound_audio_queue=self.outbound_audio_queue,
+        )
+
+        self.task_manager = TaskManager()
+
+        self.current_generation_id = 0
+
+        self.consecutive_speech_frames = 0
+
+        self.consecutive_silence_frames = 0
+
+        self.last_interrupt_at = 0.0
+
+        self.last_audio_at = time.monotonic()
+
+    async def start(self) -> None:
+        ACTIVE_CALLS.inc()
+
+        logger.info(
+            "call_session_starting",
+            session_id=self.session_id,
+        )
+
+        await self.minicpm.connect()
+
+        self.state = CallState.ACTIVE
+
+        self.task_manager.create_task(
+            self._inbound_audio_loop(),
+            name=f"inbound-audio-{self.session_id}",
+        )
+
+        self.task_manager.create_task(
+            self._outbound_audio_loop(),
+            name=f"outbound-audio-{self.session_id}",
+        )
+
+        self.task_manager.create_task(
+            self._idle_watchdog_loop(),
+            name=f"idle-watchdog-{self.session_id}",
+        )
+
+        logger.info(
+            "call_session_started",
+            session_id=self.session_id,
+        )
+
+    async def close(self) -> None:
+        if self.closed:
+            return
+
+        self.closed = True
+
+        self.state = CallState.CLOSING
+
+        logger.info(
+            "call_session_closing",
+            session_id=self.session_id,
+        )
+
+        await self.task_manager.cancel_all()
+
+        await self.minicpm.close()
+
+        duration = (
+            time.monotonic()
+            - self.created_at
+        )
+
+        SESSION_DURATION.observe(duration)
+
+        ACTIVE_CALLS.dec()
+
+        self.state = CallState.CLOSED
+
+        logger.info(
+            "call_session_closed",
+            session_id=self.session_id,
+            duration_seconds=round(duration, 2),
+        )
+
+    async def receive_audio(
+        self,
+        pcm: bytes,
+    ) -> None:
+        self.last_audio_at = time.monotonic()
+
+        AUDIO_IN_BYTES.inc(len(pcm))
+
+        self.audio_history.append(pcm)
+
+        chunks = self.chunker.append(pcm)
+
+        for chunk in chunks:
+            try:
+                self.inbound_audio_queue.put_nowait(
+                    chunk
+                )
+
+            except asyncio.QueueFull:
+                INBOUND_QUEUE_DROPS.inc()
+
+                logger.warning(
+                    "inbound_audio_queue_full",
+                    session_id=self.session_id,
+                )
+
+    async def _inbound_audio_loop(self) -> None:
+        while True:
+            pcm = (
+                await self.inbound_audio_queue.get()
+            )
+
+            speech = self.vad.is_speech(
+                pcm
+            )
+
+            silence = (
+                self.silence_detector
+                .is_silence(pcm)
+            )
+
+            if speech:
+                self.consecutive_speech_frames += 1
+            else:
+                self.consecutive_speech_frames = 0
+
+            if silence:
+                self.consecutive_silence_frames += 1
+            else:
+                self.consecutive_silence_frames = 0
+
+            required_interrupt_frames = (
+                self.settings.interrupt_speech_ms
+                // self.settings.audio_chunk_ms
+            )
+
+            if (
+                self.consecutive_speech_frames
+                >= required_interrupt_frames
+            ):
+                await self._handle_interrupt()
+
+            await self.minicpm.send_audio(
+                pcm
+            )
+
+            await self._maybe_commit_audio()
+
+    async def _maybe_commit_audio(
+        self,
+    ) -> None:
+        if (
+            not self.settings
+            .minicpm_auto_commit_audio
+        ):
+            return
+
+        required_silence_frames = (
+            self.settings.silence_commit_ms
+            // self.settings.audio_chunk_ms
+        )
+
+        if (
+            self.consecutive_silence_frames
+            >= required_silence_frames
+        ):
+            logger.info(
+                "audio_commit_triggered",
+                session_id=self.session_id,
+            )
+
+            self.consecutive_silence_frames = 0
+
+            await self.minicpm.commit_audio()
+
+    async def _outbound_audio_loop(self) -> None:
+        while True:
+            frame = (
+                await self.outbound_audio_queue.get()
+            )
+
+            if (
+                frame.generation_id
+                != self.minicpm.current_generation_id
+            ):
+                logger.debug(
+                    "dropping_stale_audio",
+                    session_id=self.session_id,
+                    generation_id=(
+                        frame.generation_id
+                    ),
+                )
+
+                continue
+
+            AUDIO_OUT_BYTES.inc(
+                len(frame.audio)
+            )
+
+            if (
+                self.settings
+                .enable_audio_pacing
+            ):
+                await self.audio_clock.pace(
+                    frame.audio
+                )
+
+            try:
+                await self.websocket.send(
+                    frame.audio
+                )
+
+            except Exception:
+                logger.exception(
+                    "outbound_audio_send_failed",
+                    session_id=self.session_id,
+                )
+
+                raise
+
+    async def _handle_interrupt(
+        self,
+    ) -> None:
+        now = time.monotonic()
+
+        delta = (
+            now - self.last_interrupt_at
+        )
+
+        if (
+            delta > 0
+            and (1 / delta)
+            > self.settings
+            .max_interrupts_per_second
+        ):
+            return
+
+        self.last_interrupt_at = now
+
+        self.consecutive_speech_frames = 0
+
+        INTERRUPT_COUNT.inc()
+
+        logger.info(
+            "interrupt_detected",
+            session_id=self.session_id,
+        )
+
+        generation_id = (
+            await self.minicpm.interrupt()
+        )
+
+        self.current_generation_id = (
+            generation_id
+        )
+
+        dropped = (
+            self.playback_buffer
+            .clear_stale(
+                active_generation_id=(
+                    generation_id
+                )
+            )
+        )
+
+        logger.info(
+            "playback_buffer_cleared",
+            session_id=self.session_id,
+            dropped_frames=dropped,
+        )
+
+    async def _idle_watchdog_loop(
+        self,
+    ) -> None:
+        while True:
+            await asyncio.sleep(5)
+
+            idle_seconds = (
+                time.monotonic()
+                - self.last_audio_at
+            )
+
+            if (
+                idle_seconds
+                > self.settings
+                .session_idle_timeout_seconds
+            ):
+                logger.info(
+                    "session_idle_timeout",
+                    session_id=self.session_id,
+                    idle_seconds=round(
+                        idle_seconds,
+                        2,
+                    ),
+                )
+
+                await self.websocket.close()
+
+                return
+```
+
+File: src/audio/turn_detector.py
+
+```python
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+
+@dataclass(slots=True)
+class TurnDetectionResult:
+    should_interrupt: bool = False
+
+    should_commit: bool = False
+
+
+class TurnDetector:
+    """
+    Stateful speech turn detector.
+
+    Separates:
+    - interruption logic
+    - endpointing logic
+
+    This becomes extremely important once:
+    - latency tuning
+    - multilingual callers
+    - noisy PSTN environments
+    - duplex overlap
+
+    enter the system.
+    """
+
+    def __init__(
+        self,
+        interrupt_frames: int,
+        silence_frames: int,
+    ) -> None:
+        self.interrupt_frames = interrupt_frames
+
+        self.silence_frames = silence_frames
+
+        self.speech_counter = 0
+
+        self.silence_counter = 0
+
+        self.user_currently_speaking = False
+
+    def update(
+        self,
+        is_speech: bool,
+        is_silence: bool,
+    ) -> TurnDetectionResult:
+        result = TurnDetectionResult()
+
+        if is_speech:
+            self.speech_counter += 1
+            self.silence_counter = 0
+
+        elif is_silence:
+            self.silence_counter += 1
+            self.speech_counter = 0
+
+        else:
+            self.speech_counter = 0
+
+        if (
+            self.speech_counter
+            >= self.interrupt_frames
+        ):
+            if not self.user_currently_speaking:
+                result.should_interrupt = True
+
+            self.user_currently_speaking = True
+
+        if (
+            self.user_currently_speaking
+            and self.silence_counter
+            >= self.silence_frames
+        ):
+            result.should_commit = True
+
+            self.user_currently_speaking = False
+
+            self.speech_counter = 0
+
+            self.silence_counter = 0
+
+        return result
+```
+
+--------------------------------------------------
+UPDATED FILE: src/ai/protocol.py
+--------------------------------------------------
+
+Replace file with:
+
+```python
+from __future__ import annotations
+
+from dataclasses import dataclass
+from enum import Enum
+
+
+class MiniCPMMessageType(str, Enum):
+    SESSION_CREATED = "session.created"
+
+    INPUT_AUDIO_BUFFER_APPEND = (
+        "input_audio_buffer.append"
+    )
+
+    INPUT_AUDIO_BUFFER_COMMIT = (
+        "input_audio_buffer.commit"
+    )
+
+    RESPONSE_AUDIO_DELTA = (
+        "response.audio.delta"
+    )
+
+    RESPONSE_AUDIO_DONE = (
+        "response.audio.done"
+    )
+
+    RESPONSE_STARTED = "response.started"
+
+    RESPONSE_DONE = "response.done"
+
+    INTERRUPT = "response.interrupt"
+
+    PING = "ping"
+
+    PONG = "pong"
+
+    ERROR = "error"
+
+
+@dataclass(slots=True)
+class AudioFrame:
+    audio: bytes
+
+    timestamp_ms: int | None = None
+
+
+@dataclass(slots=True)
+class OutboundAudioFrame:
+    generation_id: int
+
+    audio: bytes
+
+
+@dataclass(slots=True)
+class InterruptEvent:
+    generation_id: int
+
+
+@dataclass(slots=True)
+class ResponseStartedEvent:
+    generation_id: int
+
+
+@dataclass(slots=True)
+class ResponseDoneEvent:
+    generation_id: int
+```
+
+--------------------------------------------------
+UPDATED FILE: src/config/settings.py
+--------------------------------------------------
+
+Add these settings:
+
+```python
+    enable_turn_detection: bool = True
+
+    turn_interrupt_min_frames: int = 12
+
+    turn_commit_min_frames: int = 45
+
+    outbound_ws_send_timeout_seconds: float = 5.0
+
+    inbound_audio_max_frame_size_bytes: int = 65536
+
+    log_audio_frame_events: bool = False
+```
+
+--------------------------------------------------
+File: src/audio/frame_validator.py
+
+```python
+from __future__ import annotations
+
+from config.settings import get_settings
+
+
+class AudioFrameValidator:
+    """
+    Guards against malformed audio frames.
+
+    Protects:
+    - memory abuse
+    - websocket flooding
+    - broken upstream payloads
+    """
+
+    def __init__(self) -> None:
+        self.settings = get_settings()
+
+    def validate(
+        self,
+        pcm: bytes,
+    ) -> bool:
+        if not pcm:
+            return False
+
+        if (
+            len(pcm)
+            > self.settings
+            .inbound_audio_max_frame_size_bytes
+        ):
+            return False
+
+        if len(pcm) % 2 != 0:
+            return False
+
+        return True
+```
+
+--------------------------------------------------
+UPDATED FILE: src/freeswitch/connection.py
+--------------------------------------------------
+
+Replace file with:
+
+```python
+from __future__ import annotations
+
+import asyncio
+
+import structlog
+from websockets.server import WebSocketServerProtocol
+
+from audio.frame_validator import (
+    AudioFrameValidator,
+)
+from session.call_session import CallSession
+
+logger = structlog.get_logger(__name__)
+
+
+class FreeSwitchConnectionHandler:
+    def __init__(
+        self,
+        websocket: WebSocketServerProtocol,
+    ) -> None:
+        self.websocket = websocket
+
+        self.validator = AudioFrameValidator()
+
+        self.session = CallSession(
+            websocket=websocket,
+        )
+
+        self.reader_task: asyncio.Task | None = None
+
+    async def run(self) -> None:
+        await self.session.start()
+
+        self.reader_task = asyncio.create_task(
+            self._reader_loop(),
+            name=(
+                "freeswitch-reader-"
+                f"{self.session.session_id}"
+            ),
+        )
+
+        try:
+            await self.reader_task
+
+        finally:
+            await self.session.close()
+
+    async def _reader_loop(self) -> None:
+        async for message in self.websocket:
+            if not isinstance(message, bytes):
+                logger.warning(
+                    "non_binary_audio_frame",
+                    session_id=(
+                        self.session.session_id
+                    ),
+                )
+
+                continue
+
+            if not self.validator.validate(
+                message
+            ):
+                logger.warning(
+                    "invalid_audio_frame",
+                    session_id=(
+                        self.session.session_id
+                    ),
+                    size=len(message),
+                )
+
+                continue
+
+            await self.session.receive_audio(
+                message
+            )
+```
+
+--------------------------------------------------
+UPDATED FILE: src/ai/minicpm_client.py
+--------------------------------------------------
+
+ADD THIS METHOD inside MiniCPMClient:
+
+```python
+    async def commit_audio(self) -> None:
+        await self._ensure_connection()
+
+        if not self.websocket:
+            return
+
+        payload = {
+            "type": (
+                MiniCPMMessageType
+                .INPUT_AUDIO_BUFFER_COMMIT
+                .value
+            ),
+        }
+
+        try:
+            async with self._write_lock:
+                await self.websocket.send(
+                    orjson.dumps(payload).decode()
+                )
+
+        except Exception:
+            logger.exception(
+                "audio_commit_failed",
+                session_id=self.session_id,
+            )
+
+            self.connected = False
+```
+
+--------------------------------------------------
+UPDATED FILE: src/session/call_session.py
+--------------------------------------------------
+
+ONLY replace the following sections.
+
+1. ADD imports:
+
+```python
+from audio.turn_detector import TurnDetector
+```
+
+2. REMOVE:
+
+```python
+        self.consecutive_speech_frames = 0
+
+        self.consecutive_silence_frames = 0
+```
+
+3. ADD:
+
+```python
+        self.turn_detector = TurnDetector(
+            interrupt_frames=(
+                self.settings
+                .turn_interrupt_min_frames
+            ),
+            silence_frames=(
+                self.settings
+                .turn_commit_min_frames
+            ),
+        )
+```
+
+4. REPLACE ENTIRE `_inbound_audio_loop`
+
+WITH:
+
+```python
+    async def _inbound_audio_loop(self) -> None:
+        while True:
+            pcm = (
+                await self.inbound_audio_queue.get()
+            )
+
+            speech = self.vad.is_speech(
+                pcm
+            )
+
+            silence = (
+                self.silence_detector
+                .is_silence(pcm)
+            )
+
+            result = self.turn_detector.update(
+                is_speech=speech,
+                is_silence=silence,
+            )
+
+            if result.should_interrupt:
+                await self._handle_interrupt()
+
+            await self.minicpm.send_audio(
+                pcm
+            )
+
+            if result.should_commit:
+                await self._handle_commit()
+```
+
+5. ADD new method:
+
+```python
+    async def _handle_commit(
+        self,
+    ) -> None:
+        logger.info(
+            "committing_audio_turn",
+            session_id=self.session_id,
+        )
+
+        await self.minicpm.commit_audio()
+```
+
+6. REMOVE old `_maybe_commit_audio` method completely.
+
+7. REMOVE inside `_handle_interrupt`:
+
+```python
+        self.consecutive_speech_frames = 0
+```
+
+At this stage, the architecture is now transitioning from:
+- simple streaming demo
+
+toward:
+- true conversational realtime orchestration
+
+Key upgrades just added:
+- stateful turn detection
+- clean endpointing separation
+- frame validation
+- commit orchestration
+- safer websocket boundaries
+- cleaner conversational semantics
+
+This is now structurally much closer to how production realtime voice agents are actually built.
