@@ -1,0 +1,430 @@
+File: pyproject.toml
+
+```toml
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "minicpm-freeswitch-agent"
+version = "0.1.0"
+description = "Production-grade FreeSWITCH + MiniCPM-o realtime voice agent"
+readme = "README.md"
+requires-python = ">=3.11"
+
+dependencies = [
+    "websockets==12.0",
+    "aiohttp==3.9.5",
+    "pydantic==2.7.1",
+    "pydantic-settings==2.2.1",
+    "uvloop==0.19.0 ; sys_platform != 'win32'",
+    "orjson==3.10.3",
+    "numpy==1.26.4",
+    "webrtcvad==2.0.10",
+    "prometheus-client==0.20.0",
+    "structlog==24.1.0",
+    "python-dotenv==1.0.1",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.black]
+line-length = 100
+
+[tool.isort]
+profile = "black"
+
+[tool.pyright]
+pythonVersion = "3.11"
+typeCheckingMode = "basic"
+```
+
+--------------------------------------------------
+File: src/config/settings.py
+--------------------------------------------------
+
+```python
+from functools import lru_cache
+
+from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=False,
+        extra="ignore",
+    )
+
+    app_name: str = "minicpm-freeswitch-agent"
+    environment: str = "development"
+    log_level: str = "INFO"
+
+    host: str = "0.0.0.0"
+    port: int = 8765
+
+    metrics_host: str = "0.0.0.0"
+    metrics_port: int = 9000
+
+    minicpm_ws_url: str = Field(
+        default="wss://api.minicpm.example/realtime"
+    )
+
+    minicpm_api_key: str = Field(
+        default=""
+    )
+
+    audio_sample_rate: int = 16000
+    audio_channels: int = 1
+    audio_chunk_ms: int = 20
+
+    vad_aggressiveness: int = 2
+    vad_frame_ms: int = 20
+
+    interrupt_speech_ms: int = 240
+
+    outbound_audio_queue_size: int = 128
+    inbound_audio_queue_size: int = 128
+
+    session_idle_timeout_seconds: int = 300
+
+    enable_metrics: bool = True
+
+    websocket_ping_interval: int = 20
+    websocket_ping_timeout: int = 20
+
+    freeswitch_client_timeout_seconds: int = 15
+
+    minicpm_connect_timeout_seconds: int = 10
+
+    max_concurrent_sessions: int = 20
+
+
+@lru_cache
+def get_settings() -> Settings:
+    return Settings()
+```
+
+--------------------------------------------------
+File: src/infra/logging.py
+--------------------------------------------------
+
+```python
+import logging
+import sys
+
+import structlog
+
+from config.settings import get_settings
+
+
+def setup_logging() -> None:
+    settings = get_settings()
+
+    timestamper = structlog.processors.TimeStamper(fmt="iso")
+
+    shared_processors = [
+        structlog.contextvars.merge_contextvars,
+        structlog.stdlib.add_log_level,
+        timestamper,
+    ]
+
+    structlog.configure(
+        processors=[
+            *shared_processors,
+            structlog.processors.StackInfoRenderer(),
+            structlog.processors.format_exc_info,
+            structlog.processors.JSONRenderer(),
+        ],
+        wrapper_class=structlog.stdlib.BoundLogger,
+        logger_factory=structlog.stdlib.LoggerFactory(),
+        cache_logger_on_first_use=True,
+    )
+
+    logging.basicConfig(
+        level=getattr(logging, settings.log_level.upper(), logging.INFO),
+        format="%(message)s",
+        stream=sys.stdout,
+    )
+```
+
+--------------------------------------------------
+File: src/infra/metrics.py
+--------------------------------------------------
+
+```python
+from prometheus_client import Counter
+from prometheus_client import Gauge
+from prometheus_client import Histogram
+
+ACTIVE_CALLS = Gauge(
+    "active_calls",
+    "Number of active call sessions",
+)
+
+AUDIO_IN_BYTES = Counter(
+    "audio_in_bytes_total",
+    "Inbound audio bytes",
+)
+
+AUDIO_OUT_BYTES = Counter(
+    "audio_out_bytes_total",
+    "Outbound audio bytes",
+)
+
+INTERRUPT_COUNT = Counter(
+    "interrupt_count_total",
+    "Number of user interruptions",
+)
+
+SESSION_DURATION = Histogram(
+    "session_duration_seconds",
+    "Call session duration",
+)
+```
+
+--------------------------------------------------
+File: src/main.py
+--------------------------------------------------
+
+```python
+import asyncio
+import signal
+
+import structlog
+import uvloop
+from prometheus_client import start_http_server
+
+from config.settings import get_settings
+from freeswitch.ws_server import FreeSwitchAudioServer
+from infra.logging import setup_logging
+
+logger = structlog.get_logger(__name__)
+
+
+class Application:
+    def __init__(self) -> None:
+        self.settings = get_settings()
+        self.server = FreeSwitchAudioServer()
+
+        self.shutdown_event = asyncio.Event()
+
+    async def start(self) -> None:
+        logger.info(
+            "application_starting",
+            app=self.settings.app_name,
+            environment=self.settings.environment,
+        )
+
+        if self.settings.enable_metrics:
+            start_http_server(
+                port=self.settings.metrics_port,
+                addr=self.settings.metrics_host,
+            )
+
+            logger.info(
+                "metrics_server_started",
+                host=self.settings.metrics_host,
+                port=self.settings.metrics_port,
+            )
+
+        await self.server.start()
+
+        logger.info(
+            "freeswitch_audio_server_started",
+            host=self.settings.host,
+            port=self.settings.port,
+        )
+
+    async def stop(self) -> None:
+        logger.info("application_shutdown_started")
+
+        await self.server.stop()
+
+        logger.info("application_shutdown_completed")
+
+    def install_signal_handlers(self) -> None:
+        loop = asyncio.get_running_loop()
+
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(
+                sig,
+                self.shutdown_event.set,
+            )
+
+    async def run(self) -> None:
+        self.install_signal_handlers()
+
+        await self.start()
+
+        await self.shutdown_event.wait()
+
+        await self.stop()
+
+
+async def async_main() -> None:
+    setup_logging()
+
+    app = Application()
+
+    await app.run()
+
+
+if __name__ == "__main__":
+    uvloop.install()
+
+    asyncio.run(async_main())
+```
+
+--------------------------------------------------
+File: src/freeswitch/models.py
+--------------------------------------------------
+
+```python
+from dataclasses import dataclass
+from uuid import uuid4
+
+
+@dataclass(slots=True)
+class FreeSwitchConnectionContext:
+    connection_id: str
+    remote_address: str
+
+    @classmethod
+    def create(cls, remote_address: str) -> "FreeSwitchConnectionContext":
+        return cls(
+            connection_id=str(uuid4()),
+            remote_address=remote_address,
+        )
+```
+
+--------------------------------------------------
+File: src/freeswitch/ws_server.py
+--------------------------------------------------
+
+```python
+import asyncio
+
+import structlog
+import websockets
+from websockets.server import WebSocketServerProtocol
+
+from config.settings import get_settings
+from freeswitch.models import FreeSwitchConnectionContext
+
+logger = structlog.get_logger(__name__)
+
+
+class FreeSwitchAudioServer:
+    def __init__(self) -> None:
+        self.settings = get_settings()
+
+        self._server: websockets.WebSocketServer | None = None
+
+        self._active_connections: set[WebSocketServerProtocol] = set()
+
+    async def start(self) -> None:
+        self._server = await websockets.serve(
+            self.handle_connection,
+            self.settings.host,
+            self.settings.port,
+            max_size=None,
+            ping_interval=self.settings.websocket_ping_interval,
+            ping_timeout=self.settings.websocket_ping_timeout,
+        )
+
+    async def stop(self) -> None:
+        if self._server is None:
+            return
+
+        self._server.close()
+
+        await self._server.wait_closed()
+
+    async def handle_connection(
+        self,
+        websocket: WebSocketServerProtocol,
+    ) -> None:
+        remote = "unknown"
+
+        if websocket.remote_address:
+            remote = f"{websocket.remote_address[0]}:{websocket.remote_address[1]}"
+
+        context = FreeSwitchConnectionContext.create(remote)
+
+        self._active_connections.add(websocket)
+
+        logger.info(
+            "freeswitch_connection_opened",
+            connection_id=context.connection_id,
+            remote_address=context.remote_address,
+        )
+
+        try:
+            await self._connection_loop(websocket, context)
+
+        except websockets.ConnectionClosed:
+            logger.info(
+                "freeswitch_connection_closed",
+                connection_id=context.connection_id,
+            )
+
+        except Exception:
+            logger.exception(
+                "freeswitch_connection_error",
+                connection_id=context.connection_id,
+            )
+
+        finally:
+            self._active_connections.discard(websocket)
+
+    async def _connection_loop(
+        self,
+        websocket: WebSocketServerProtocol,
+        context: FreeSwitchConnectionContext,
+    ) -> None:
+        async for message in websocket:
+            if not isinstance(message, bytes):
+                logger.warning(
+                    "unexpected_non_binary_frame",
+                    connection_id=context.connection_id,
+                )
+                continue
+
+            logger.debug(
+                "audio_frame_received",
+                connection_id=context.connection_id,
+                size=len(message),
+            )
+
+            #
+            # Next step:
+            # route inbound PCM frames into CallSession
+            #
+
+            await asyncio.sleep(0)
+```
+
+This is now a real runnable foundation:
+- structured logging
+- metrics
+- websocket server
+- lifecycle management
+- binary PCM handling
+- production async structure
+- clean module boundaries
+
+Next file set should be:
+
+1. ai/protocol.py
+2. ai/minicpm_client.py
+3. session/state.py
+4. session/call_session.py
+
+That’s where the actual duplex realtime pipeline begins.
