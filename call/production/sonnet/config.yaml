@@ -1,0 +1,98 @@
+# config.yaml - VoiceBot configuration
+# All values here are overridable by environment variables (VOICEBOT__*)
+
+app_name: "VoiceBot"
+app_version: "1.0.0"
+environment: "production"
+debug: false
+
+server:
+  host: "0.0.0.0"
+  audio_ws_port: 8765
+  api_port: 8080
+  max_connections: 10
+  ws_ping_interval: 20.0
+  ws_ping_timeout: 10.0
+
+esl:
+  mode: "inbound"
+  host: "127.0.0.1"
+  port: 8021
+  password: "ClueCon"
+  connect_timeout: 10.0
+  reconnect_enabled: true
+  reconnect_interval_seconds: 3.0
+  heartbeat_interval_seconds: 30.0
+
+audio:
+  fs_sample_rate: 16000
+  model_sample_rate: 16000
+  channels: 1
+  sample_width_bytes: 2
+  fs_chunk_ms: 20
+  model_chunk_ms: 100
+  enable_resampling: true
+  enable_normalization: true
+  normalization_target_dbfs: -20.0
+
+vad:
+  energy_threshold_dbfs: -40.0
+  min_speech_duration_ms: 200
+  silence_duration_ms: 700
+  interruption_silence_ms: 200
+  interruption_min_speech_ms: 250
+  use_webrtc_vad: true
+  webrtc_vad_aggressiveness: 2
+  webrtc_frame_ms: 20
+  smoothing_frames: 5
+  smoothing_threshold: 3
+
+minicpm:
+  api_base_url: "wss://api.minimaxi.chat/v1/realtime"
+  # api_key: set via MINICPM_API_KEY environment variable
+  model: "MiniCPMo-4.5"
+  system_prompt: "你是一个专业的语音助手，回答简洁自然，正在通过电话与用户交谈。"
+  language: "zh-CN"
+  temperature: 0.7
+  audio_output_format: "pcm"
+  output_sample_rate: 16000
+  first_audio_timeout_ms: 5000
+  model_silence_timeout_ms: 2000
+  send_interval_ms: 100
+
+interruption:
+  enabled: true
+  strategy: "vad"
+  grace_period_ms: 500
+  cooldown_ms: 1000
+  send_uuid_break: true
+  clear_model_audio_queue: true
+  send_model_interrupt: true
+  max_interruptions_per_session: 50
+
+metrics:
+  prometheus_enabled: true
+  prometheus_port: 9090
+  namespace: "voicebot"
+  rolling_window_seconds: 60
+  log_report_interval_seconds: 60
+  log_session_details: true
+  alert_e2e_latency_ms: 2000.0
+
+api:
+  enabled: true
+  host: "0.0.0.0"
+  port: 8080
+  auth_enabled: false
+  auth_token: ""
+  rate_limit_enabled: true
+  rate_limit_per_minute: 60
+
+log:
+  level: "INFO"
+  format: "%(asctime)s [%(levelname)s] %(name)s - %(message)s"
+  file_enabled: false
+  file_path: "logs/voicebot.log"
+  file_max_bytes: 52428800
+  file_backup_count: 5
+  json_enabled: false
