@@ -40,8 +40,82 @@ from typing import (
     Optional, Set, Tuple
 )
 
-logger = logging.getLogger(__name__)
+async def originate(
+    self,
+    destination:    str,
+    caller_id_num:  str = "8000",
+    caller_id_name: str = "VoiceBot",
+    gateway:        str = "default",
+    timeout:        int = 30,
+    variables:      Optional[Dict[str, str]] = None,
+) -> Optional[str]:
+    """
+    发起外呼，返回新建的 call_uuid。
 
+    Args:
+        destination:   被叫号码 e.g. "13800138000"
+        caller_id_num: 主叫号码显示
+        caller_id_name: 主叫名称显示
+        gateway:       SIP网关名称 (在FS Sofia配置里)
+        timeout:       振铃超时秒数
+        variables:     附加通道变量
+
+    Returns:
+        call_uuid (str) if originated successfully
+        None if failed
+    """
+    # 构建变量字符串
+    var_dict = {
+        "origination_caller_id_number": caller_id_num,
+        "origination_caller_id_name":   caller_id_name,
+        "call_timeout":                 str(timeout),
+        "ignore_early_media":           "true",
+        # 关键：外呼接听后自动进入 audio_stream
+        "voicebot_outbound":            "true",
+    }
+    if variables:
+        var_dict.update(variables)
+
+    var_str = ",".join(f"{k}={v}" for k, v in var_dict.items())
+
+    # FreeSWITCH originate 命令格式:
+    # originate {vars}sofia/gateway/<gw>/<dest> &park()
+    # &park() 让通话挂起等待我们后续控制
+    cmd = (
+        f"originate {{{var_str}}}"
+        f"sofia/gateway/{gateway}/{destination}"
+        f" &park()"
+    )
+
+    try:
+        # 用 bgapi 异步发起，不阻塞
+        event = await self.send_bgapi(cmd, timeout=float(timeout + 10))
+        body  = event.body or ""
+
+        if "+OK" in body:
+            # 从响应里提取 call_uuid
+            call_uuid = body.replace("+OK", "").strip()
+            logger.info(
+                "Outbound call originated: uuid=%s dest=%s",
+                call_uuid[:8], destination,
+            )
+            return call_uuid
+        else:
+            logger.error(
+                "Originate failed: dest=%s response=%s",
+                destination, body[:100],
+            )
+            return None
+
+    except Exception as e:
+        logger.error(
+            "Originate error: dest=%s error=%s",
+            destination, e,
+        )
+        return None
+
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Constants
