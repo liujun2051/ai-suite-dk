@@ -1,0 +1,65 @@
+<!--
+  FreeSWITCH dialplan for VoiceBot
+  Routes calls to mod_audio_stream WebSocket
+  Place in: /etc/freeswitch/dialplan/default/voicebot.xml
+-->
+
+<include>
+  <context name="default">
+
+    <!--
+      Extension 8000: VoiceBot (inbound AI assistant)
+      Caller dials 8000 → connected to MiniCPM-o via audio_stream
+    -->
+    <extension name="voicebot_main">
+      <condition field="destination_number" expression="^(8000)$">
+
+        <!-- Answer the call -->
+        <action application="answer"/>
+
+        <!-- Set audio parameters -->
+        <action application="set" data="RECORD_SAMPLE_RATE=16000"/>
+        <action application="set" data="RECORD_STEREO=false"/>
+
+        <!-- Brief pause to let audio settle -->
+        <action application="sleep" data="500"/>
+
+        <!--
+          Connect to VoiceBot WebSocket server
+          Format: ws://<host>:<port> <sample_rate> <channels>
+          mod_audio_stream sends raw binary PCM (L16)
+          and receives raw binary PCM back for playback
+        -->
+        <action application="audio_stream"
+                data="ws://127.0.0.1:8765 16000 1"/>
+
+        <!-- Call ended (audio_stream returned) -->
+        <action application="hangup"/>
+
+      </condition>
+    </extension>
+
+    <!--
+      Extension 8001: VoiceBot with recording
+    -->
+    <extension name="voicebot_recorded">
+      <condition field="destination_number" expression="^(8001)$">
+
+        <action application="answer"/>
+        <action application="set" data="RECORD_SAMPLE_RATE=16000"/>
+
+        <!-- Start recording before audio_stream -->
+        <action application="record_session"
+                data="/var/lib/freeswitch/recordings/${uuid}.wav"/>
+
+        <action application="sleep" data="500"/>
+        <action application="audio_stream"
+                data="ws://127.0.0.1:8765 16000 1"/>
+
+        <action application="hangup"/>
+
+      </condition>
+    </extension>
+
+  </context>
+</include>
