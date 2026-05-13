@@ -164,6 +164,7 @@ voicebot/
 └── monitoring/
     ├── prometheus.yml
     └── grafana/
+    
 生产部署建议
 系统要求
 项目	最低	推荐
@@ -245,11 +246,6 @@ voicebot/
 │ └── conf/dialplan/default/voicebot.xml
 └── monitoring/
 └── prometheus.yml
-
-text
-
-
----
 
 **全部完成。** 🎉
 
