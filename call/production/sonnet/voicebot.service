@@ -1,0 +1,67 @@
+# ============================================================
+# VoiceBot systemd service unit
+# Install to: /etc/systemd/system/voicebot.service
+#
+# Commands:
+#   sudo systemctl enable voicebot
+#   sudo systemctl start  voicebot
+#   sudo systemctl status voicebot
+#   sudo systemctl reload voicebot   (SIGHUP config reload)
+#   sudo journalctl -u voicebot -f   (follow logs)
+# ============================================================
+
+[Unit]
+Description=VoiceBot - MiniCPM-o 4.5 Voice AI for FreeSWITCH
+Documentation=https://github.com/yourorg/voicebot
+After=network-online.target freeswitch.service
+Wants=network-online.target
+Requires=freeswitch.service
+
+[Service]
+# ---- Identity ----
+User=voicebot
+Group=voicebot
+WorkingDirectory=/opt/voicebot
+
+# ---- Environment ----
+EnvironmentFile=-/opt/voicebot/.env
+Environment="PYTHONUNBUFFERED=1"
+Environment="PYTHONDONTWRITEBYTECODE=1"
+
+# ---- Execution ----
+ExecStart=/opt/voicebot/venv/bin/python main.py \
+    --config /opt/voicebot/config.yaml
+ExecReload=/bin/kill -HUP $MAINPID
+ExecStop=/bin/kill -TERM $MAINPID
+
+# ---- Restart policy ----
+Restart=always
+RestartSec=5s
+StartLimitIntervalSec=60s
+StartLimitBurst=5
+
+# ---- Shutdown ----
+TimeoutStopSec=30s
+KillMode=mixed
+KillSignal=SIGTERM
+
+# ---- Logging ----
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=voicebot
+
+# ---- Resource limits ----
+LimitNOFILE=65536
+LimitNPROC=4096
+Nice=-5
+
+# ---- Security hardening ----
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/opt/voicebot/logs /var/lib/voicebot/recordings
+PrivateTmp=yes
+PrivateDevices=yes
+
+[Install]
+WantedBy=multi-user.target
