@@ -143,6 +143,7 @@ class VoiceBot:
             await self._init_esl()
             await self._init_audio_server()
             await self._init_session_manager()
+            await self._init_outbound_manager() 
             await self._init_api_server()
             await self._start_background_tasks()
             self._running = True
@@ -1070,6 +1071,34 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     return exit_code
 
+async def _init_outbound_manager(self) -> None:
+    """初始化外呼管理器."""
+    logger.info("Initializing outbound call manager...")
+
+    from outbound import OutboundCallManager
+
+    self._outbound = OutboundCallManager(
+        esl=self._esl,
+        audio_server=self._audio,
+        session_manager=self._sessions,
+        cfg=self._cfg,
+        metrics=self._metrics,
+    )
+
+    # 加载 DNC 列表（如果配置了文件）
+    dnc_file = os.environ.get("VOICEBOT__DNC_FILE", "")
+    if dnc_file:
+        await self._outbound.dnc.load_file(dnc_file)
+
+    # 将外呼管理器注入 SessionManager
+    # 这样 SessionManager 能通知外呼管理器 audio_stream 已连接
+    self._sessions._outbound_manager = self._outbound
+
+    # 将外呼管理器注入 API handlers
+    if self._api:
+        self._api._handlers._outbound = self._outbound
+
+    logger.info("Outbound call manager initialized")
 
 # ---------------------------------------------------------------------------
 # Entry point
