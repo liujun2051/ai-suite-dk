@@ -1,0 +1,29 @@
+# ============================================================
+# Prometheus configuration for VoiceBot
+# ============================================================
+
+global:
+  scrape_interval:     15s
+  evaluation_interval: 15s
+  external_labels:
+    service: voicebot
+
+scrape_configs:
+
+  - job_name: voicebot
+    static_configs:
+      - targets: ["voicebot:9090"]
+    scrape_interval: 10s
+    metrics_path: /metrics
+
+  - job_name: freeswitch
+    static_configs:
+      - targets: ["freeswitch:9113"]
+    scrape_interval: 15s
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: []
+
+rule_files: []
