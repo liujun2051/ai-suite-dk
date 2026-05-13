@@ -1,0 +1,31 @@
+# ============================================================
+# VoiceBot - Python Dependencies
+# MiniCPM-o 4.5 + FreeSWITCH mod_audio_stream
+# ============================================================
+
+# ---- Core async networking ----
+websockets>=12.0          # WebSocket client + server (audio + MiniCPM-o)
+aiohttp>=3.9.0            # REST API server
+aiohttp-cors>=0.7.0       # CORS support for aiohttp
+
+# ---- Audio processing ----
+numpy>=1.24.0             # PCM resampling (medium quality)
+scipy>=1.11.0             # PCM resampling (high quality, polyphase filter)
+webrtcvad>=2.0.10         # WebRTC Voice Activity Detection
+
+# ---- Configuration ----
+python-dotenv>=1.0.0      # .env file loading
+PyYAML>=6.0               # YAML config file parsing
+
+# ---- Monitoring ----
+prometheus-client>=0.19.0 # Prometheus metrics + HTTP server
+psutil>=5.9.0             # Process memory/CPU stats for Prometheus
+
+# ---- Performance (optional but recommended on Linux) ----
+uvloop>=0.19.0            # Drop-in faster event loop (Linux/macOS only)
+
+# ---- Development / testing only ----
+pytest>=7.4.0
+pytest-asyncio>=0.23.0
+pytest-mock>=3.12.0
+httpx>=0.26.0             # Test HTTP client for API tests
