@@ -1,0 +1,200 @@
+# ============================================================
+# VoiceBot Docker Compose
+# Services: voicebot + freeswitch + prometheus + grafana
+# ============================================================
+
+version: "3.9"
+
+networks:
+  voicebot_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/24
+
+volumes:
+  recordings:
+  logs:
+  prometheus_data:
+  grafana_data:
+
+# ============================================================
+services:
+
+  # ----------------------------------------------------------
+  # VoiceBot - Main application
+  # ----------------------------------------------------------
+  voicebot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    image: voicebot:latest
+    container_name: voicebot
+    restart: unless-stopped
+
+    networks:
+      voicebot_net:
+        ipv4_address: 172.20.0.10
+
+    ports:
+      - "8765:8765"    # mod_audio_stream WebSocket
+      - "8080:8080"    # REST API
+      - "9090:9090"    # Prometheus metrics
+
+    environment:
+      # Required: MiniCPM-o API key
+      - MINICPM_API_KEY=${MINICPM_API_KEY}
+
+      # FreeSWITCH ESL (points to freeswitch container)
+      - VOICEBOT__ESL__HOST=freeswitch
+      - VOICEBOT__ESL__PORT=8021
+      - VOICEBOT__ESL__PASSWORD=${ESL_PASSWORD:-ClueCon}
+
+      # Application settings
+      - VOICEBOT__ENVIRONMENT=production
+      - VOICEBOT__LOG__LEVEL=INFO
+      - VOICEBOT__LOG__FILE_ENABLED=true
+      - VOICEBOT__LOG__FILE_PATH=/app/logs/voicebot.log
+
+      # Audio settings
+      - VOICEBOT__AUDIO__FS_SAMPLE_RATE=16000
+      - VOICEBOT__AUDIO__MODEL_SAMPLE_RATE=16000
+
+      # API auth (optional)
+      - VOICEBOT__API__AUTH_ENABLED=${API_AUTH_ENABLED:-false}
+      - VOICEBOT__API__AUTH_TOKEN=${API_AUTH_TOKEN:-}
+
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - logs:/app/logs
+      - recordings:/var/lib/voicebot/recordings
+
+    depends_on:
+      freeswitch:
+        condition: service_healthy
+
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+
+  # ----------------------------------------------------------
+  # FreeSWITCH
+  # ----------------------------------------------------------
+  freeswitch:
+    image: signalwire/freeswitch:latest
+    container_name: freeswitch
+    restart: unless-stopped
+
+    networks:
+      voicebot_net:
+        ipv4_address: 172.20.0.20
+
+    ports:
+      - "5060:5060/udp"    # SIP
+      - "5060:5060/tcp"    # SIP TCP
+      - "5080:5080/udp"    # SIP outbound
+      - "16384-16484:16384-16484/udp"  # RTP media
+
+    environment:
+      - FREESWITCH_DOMAIN=${FREESWITCH_DOMAIN:-localhost}
+
+    volumes:
+      - ./freeswitch/conf:/etc/freeswitch:ro
+      - recordings:/var/lib/freeswitch/recordings
+
+    healthcheck:
+      test: ["CMD", "fs_cli", "-x", "status"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+    cap_add:
+      - SYS_NICE    # for real-time audio scheduling
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+
+  # ----------------------------------------------------------
+  # Prometheus
+  # ----------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    restart: unless-stopped
+
+    networks:
+      voicebot_net:
+        ipv4_address: 172.20.0.30
+
+    ports:
+      - "9091:9090"
+
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=30d"
+      - "--web.enable-lifecycle"
+
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+
+    depends_on:
+      - voicebot
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+
+  # ----------------------------------------------------------
+  # Grafana
+  # ----------------------------------------------------------
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    restart: unless-stopped
+
+    networks:
+      voicebot_net:
+        ipv4_address: 172.20.0.40
+
+    ports:
+      - "3000:3000"
+
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_SERVER_ROOT_URL=http://localhost:3000
+
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources:ro
+
+    depends_on:
+      - prometheus
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
