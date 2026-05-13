@@ -2,7 +2,6 @@
 
 **MiniCPM-o 4.5 全双工语音AI + FreeSWITCH mod_audio_stream**
 
----
 电话用户
 │ SIP
 ▼
@@ -25,17 +24,14 @@ MiniCPM-o 4.5 云端API
 
 text
 
-
----
-
 ## 快速开始
 
 ### 1. 安装依赖
 
-```bash
 python -m venv venv
 source venv/bin/activate      # Windows: venv\Scripts\activate
 pip install -r requirements.txt
+
 2. 配置
 Bash
 
@@ -81,8 +77,6 @@ systemctl restart freeswitch
 将 freeswitch/conf/dialplan/default/voicebot.xml
 复制到 /etc/freeswitch/dialplan/default/，然后：
 
-Bash
-
 fs_cli -x "reloadxml"
 拨打 8000 即可测试。
 
@@ -104,7 +98,7 @@ GET	/metrics	指标快照 (JSON)
 GET	/stats	系统统计
 GET	/stream/stats	SSE 实时推送
 示例
-Bash
+
 
 # 查看所有活跃通话
 curl http://localhost:8080/sessions
