@@ -1,1007 +1,592 @@
-#!/usr/bin/env python3
-"""
-智能外呼机器人 - FreeSWITCH + MiniCPM-o 4.5
-增强轮询方案：支持打断 + 停顿检测 + 伪全双工
-
-核心设计：
-1. 100ms 超短轮询周期，录音到 /dev/shm（内存文件系统）
-2. 本地 VAD 实时检测用户说话/停顿
-3. 用户说话时立即打断 AI 播放
-4. 检测到停顿（静音>800ms）后提交整句给 AI
-
-依赖：
-    pip install websockets numpy webrtcvad
-    # FreeSWITCH 需要 mod_sndfile 支持 wav 格式
-"""
-
-import asyncio
-import json
-import base64
-import os
-import time
-import wave
-import io
-import concurrent.futures
-import logging
-from typing import Optional, Dict, Any, Callable, Deque
-from dataclasses import dataclass, field
-from collections import deque
-from enum import Enum, auto
-
-import numpy as np
-import websockets
-
-try:
-    import webrtcvad
-    WEBRTC_VAD_AVAILABLE = True
-except ImportError:
-    WEBRTC_VAD_AVAILABLE = False
-    print("警告: webrtcvad 未安装，将使用能量阈值 VAD。安装: pip install webrtcvad")
-
-try:
-    from ESL import ESLconnection
-except ImportError:
-    raise ImportError(
-        "ESL 模块未安装。请执行：\n"
-        "cd /usr/local/src/freeswitch/libs/esl/python\n"
-        "sudo python3 setup.py install"
-    )
-
-# ========== 日志配置 ==========
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
-
-# ========== 配置 ==========
-@dataclass
-class Config:
-    """全局配置"""
-    # FreeSWITCH
-    fs_host: str = "127.0.0.1"
-    fs_port: int = 8021
-    fs_pass: str = "ClueCon"
-    fs_sample_rate: int = 8000      # FreeSWITCH 默认 8kHz
-    
-    # MiniCPM-o
-    minicpmo_ws_url: str = "wss://api.modelbest.cn/v1/realtime?mode=audio"
-    minicpmo_api_key: str = "你的API_Key"
-    minicpmo_sample_rate: int = 16000
-    
-    # 轮询参数
-    chunk_duration_ms: int = 100    # 每轮录音 100ms
-    max_sentence_silence_ms: int = 800  # 停顿超过 800ms 视为句子结束
-    pre_buffer_ms: int = 300        # 预缓冲 300ms（避免截断开头）
-    
-    # VAD
-    vad_aggressiveness: int = 2     # webrtcvad 激进程度 0-3
-    energy_threshold: float = 0.015 # 能量阈值（webrtcvad 不可用时）
-    
-    # 路径（使用 /dev/shm 内存文件系统）
-    shm_dir: str = "/dev/shm/fs_bot"
-    tts_dir: str = "/dev/shm/fs_tts"
-    
-    # 业务
-    caller_id: str = "你的外显号码"
-    gateway: str = "fxo-gateway"
-    max_call_duration_sec: int = 600  # 10 分钟超时
-
-CONFIG = Config()
-
-# ========== 知识库 ==========
-KNOWLEDGE_BASE = """
-你是XX公司的专业客服代表，请严格遵循以下信息：
-
-【公司介绍】
-我们专注于企业级AI语音解决方案，核心产品MiniCPM-o系列全双工语音模型。
-
-【产品优势】
-1. 原生全双工：用户可随时打断，实时响应
-2. 声音克隆：任意音色克隆，低于0.6秒延迟
-3. 中文表现：语音识别错误率仅0.86%
-
-【常见问题】
-- 价格：基础版月费XXX元，企业版请咨询销售
-- 技术参数：支持WebSocket API，8192上下文
-- 售后：7x24小时技术支持
-
-【话术要求】
-- 语气亲切专业，像真人一样自然
-- 客户问不知道的问题，诚实告知并记录
-- 不得虚构产品功能
-- 每次回复控制在30秒以内
-- 如果客户说"不需要"、"挂了"、"拜拜"等，礼貌结束对话
-"""
-
-# ========== 音频工具 ==========
-class AudioUtils:
-    """音频处理工具"""
-    
-    @staticmethod
-    def pcmu_decode(data: bytes) -> np.ndarray:
-        """PCMU 解码为 float32 [-1, 1]"""
-        MULAW_BIAS = 33
-        exp_lut = [0, 132, 396, 924, 1980, 4092, 8316, 16764]
-        
-        result = np.zeros(len(data), dtype=np.float32)
-        for i, byte in enumerate(data):
-            byte = ~byte & 0xFF
-            sign = (byte & 0x80)
-            exponent = (byte >> 4) & 0x07
-            mantissa = byte & 0x0F
-            sample = exp_lut[exponent] + (mantissa << (exponent + 3))
-            if sign:
-                sample = -sample
-            result[i] = (sample - MULAW_BIAS) / 32768.0
-        return result
-    
-    @staticmethod
-    def pcmu_encode(data: np.ndarray) -> bytes:
-        """float32 [-1, 1] 编码为 PCMU"""
-        data = np.clip(data, -1.0, 1.0)
-        samples = (data * 32768).astype(np.int16)
-        
-        result = bytearray(len(samples))
-        for i, sample in enumerate(samples):
-            sign = 0x80 if sample < 0 else 0
-            sample = abs(int(sample))
-            
-            if sample < 256:
-                encoded = sample >> 4
-            elif sample < 512:
-                encoded = 0x10 | ((sample - 256) >> 5)
-            elif sample < 1024:
-                encoded = 0x20 | ((sample - 512) >> 6)
-            elif sample < 2048:
-                encoded = 0x30 | ((sample - 1024) >> 7)
-            elif sample < 4096:
-                encoded = 0x40 | ((sample - 2048) >> 8)
-            elif sample < 8192:
-                encoded = 0x50 | ((sample - 4096) >> 9)
-            elif sample < 16384:
-                encoded = 0x60 | ((sample - 8192) >> 10)
-            else:
-                encoded = 0x70 | ((sample - 16384) >> 11)
-            
-            result[i] = ~(sign | encoded) & 0xFF
-        return bytes(result)
-    
-    @staticmethod
-    def resample(data: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
-        """线性插值重采样"""
-        if orig_sr == target_sr:
-            return data
-        ratio = target_sr / orig_sr
-        new_length = int(len(data) * ratio)
-        old_indices = np.linspace(0, len(data) - 1, new_length)
-        indices = old_indices.astype(np.int32)
-        frac = old_indices - indices
-        
-        result = np.zeros(new_length, dtype=np.float32)
-        for i in range(new_length):
-            idx = min(indices[i], len(data) - 2)
-            result[i] = data[idx] * (1 - frac[i]) + data[idx + 1] * frac[i]
-        return result
-    
-    @staticmethod
-    def float_to_int16(data: np.ndarray) -> np.ndarray:
-        return (np.clip(data, -1.0, 1.0) * 32767).astype(np.int16)
-    
-    @staticmethod
-    def int16_to_float(data: np.ndarray) -> np.ndarray:
-        return data.astype(np.float32) / 32768.0
-    
-    @staticmethod
-    def create_wav_header(data_bytes: bytes, sample_rate: int, channels: int = 1, bits: int = 16) -> bytes:
-        """创建 WAV 文件头"""
-        byte_rate = sample_rate * channels * bits // 8
-        block_align = channels * bits // 8
-        
-        header = b'RIFF'
-        header += (36 + len(data_bytes)).to_bytes(4, 'little')
-        header += b'WAVE'
-        header += b'fmt '
-        header += (16).to_bytes(4, 'little')  # Subchunk1Size
-        header += (1).to_bytes(2, 'little')   # AudioFormat (PCM)
-        header += channels.to_bytes(2, 'little')
-        header += sample_rate.to_bytes(4, 'little')
-        header += byte_rate.to_bytes(4, 'little')
-        header += block_align.to_bytes(2, 'little')
-        header += bits.to_bytes(2, 'little')
-        header += b'data'
-        header += len(data_bytes).to_bytes(4, 'little')
-        return header
-
-# ========== VAD 检测器 ==========
-class VADState(Enum):
-    SILENCE = auto()      # 静音
-    SPEECH = auto()       # 说话中
-    SPEECH_END = auto()   # 检测到句子结束（停顿）
-
-class VADDetector:
-    """VAD 检测器：支持 webrtcvad 和能量阈值双模式"""
-    
-    def __init__(self, sample_rate: int = 16000, frame_duration_ms: int = 30):
-        self.sample_rate = sample_rate
-        self.frame_duration_ms = frame_duration_ms
-        self.frame_size = int(sample_rate * frame_duration_ms / 1000)
-        
-        # webrtcvad
-        self.vad = None
-        if WEBRTC_VAD_AVAILABLE and sample_rate in (8000, 16000, 32000, 48000):
-            self.vad = webrtcvad.Vad(CONFIG.vad_aggressiveness)
-        
-        # 能量阈值备用
-        self.energy_threshold = CONFIG.energy_threshold
-        
-        # 状态
-        self.state = VADState.SILENCE
-        self.silence_frames = 0
-        self.speech_frames = 0
-        self.max_silence_frames = int(CONFIG.max_sentence_silence_ms / frame_duration_ms)
-        self.min_speech_frames = 3  # 至少 3 帧才认为是有效语音（避免噪声）
-        
-        # 音频缓冲区
-        self.audio_buffer: Deque[np.ndarray] = deque()
-        self.pre_buffer: Deque[np.ndarray] = deque(maxlen=int(CONFIG.pre_buffer_ms / frame_duration_ms))
-    
-    def process(self, audio_frame: np.ndarray) -> tuple:
-        """
-        处理音频帧
-        返回: (state: VADState, is_speech: bool, is_sentence_end: bool)
-        """
-        # 确保帧大小正确
-        if len(audio_frame) < self.frame_size:
-            audio_frame = np.pad(audio_frame, (0, self.frame_size - len(audio_frame)))
-        
-        # 转换为 int16 用于 webrtcvad
-        pcm_int16 = AudioUtils.float_to_int16(audio_frame)
-        
-        # VAD 检测
-        is_speech = False
-        
-        if self.vad:
-            try:
-                frame_bytes = pcm_int16.tobytes()
-                is_speech = self.vad.is_speech(frame_bytes, self.sample_rate)
-            except:
-                is_speech = False
-        
-        if not is_speech:
-            # 能量阈值备用检测
-            energy = np.sqrt(np.mean(audio_frame ** 2))
-            is_speech = energy > self.energy_threshold
-        
-        # 状态机
-        if is_speech:
-            self.silence_frames = 0
-            self.speech_frames += 1
-            
-            if self.state == VADState.SILENCE and self.speech_frames >= self.min_speech_frames:
-                self.state = VADState.SPEECH
-                # 将预缓冲区加入主缓冲区
-                self.audio_buffer.extend(self.pre_buffer)
-                self.pre_buffer.clear()
-                return VADState.SPEECH, True, False
-            
-            if self.state == VADState.SPEECH:
-                self.audio_buffer.append(audio_frame)
-                return VADState.SPEECH, True, False
-            
-            # 还在预缓冲阶段
-            self.pre_buffer.append(audio_frame)
-            return VADState.SILENCE, False, False
-        
-        else:  # 静音
-            self.speech_frames = 0
-            self.silence_frames += 1
-            
-            if self.state == VADState.SPEECH:
-                self.audio_buffer.append(audio_frame)
-                
-                if self.silence_frames >= self.max_silence_frames:
-                    self.state = VADState.SPEECH_END
-                    return VADState.SPEECH_END, False, True
-                
-                return VADState.SPEECH, False, False
-            
-            # 预缓冲阶段也保留一点静音
-            if len(self.pre_buffer) < self.pre_buffer.maxlen:
-                self.pre_buffer.append(audio_frame)
-            
-            self.state = VADState.SILENCE
-            return VADState.SILENCE, False, False
-    
-    def get_buffered_audio(self) -> np.ndarray:
-        """获取缓冲的音频并清空"""
-        if not self.audio_buffer:
-            return np.array([], dtype=np.float32)
-        
-        result = np.concatenate(list(self.audio_buffer))
-        self.audio_buffer.clear()
-        self.state = VADState.SILENCE
-        self.silence_frames = 0
-        return result
-    
-    def reset(self):
-        """重置状态"""
-        self.state = VADState.SILENCE
-        self.silence_frames = 0
-        self.speech_frames = 0
-        self.audio_buffer.clear()
-        self.pre_buffer.clear()
-
-# ========== 异步 ESL 封装 ==========
-class AsyncESL:
-    """异步 ESL 连接"""
-    
-    def __init__(self, host: str, port: int, password: str):
-        self.host = host
-        self.port = port
-        self.password = password
-        self.conn: Optional[ESLconnection] = None
-        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
-        self._connected = False
-        self._event_callbacks: Dict[str, list] = {}
-        self._event_thread: Optional[threading.Thread] = None
-        self._stop_event = threading.Event()
-    
-    async def connect(self) -> bool:
-        loop = asyncio.get_event_loop()
-        
-        def _connect():
-            conn = ESLconnection(self.host, self.port, self.password)
-            if conn.connected():
-                conn.events("plain", "ALL")
-                return conn
-            return None
-        
-        self.conn = await loop.run_in_executor(self.executor, _connect)
-        if self.conn:
-            self._connected = True
-            self._event_thread = threading.Thread(target=self._event_loop, daemon=True)
-            self._event_thread.start()
-            logger.info("FreeSWITCH ESL 连接成功")
-            return True
-        return False
-    
-    def _event_loop(self):
-        while not self._stop_event.is_set() and self.conn:
-            try:
-                event = self.conn.recvEventTimed(100)
-                if event:
-                    event_name = event.getHeader("Event-Name")
-                    if event_name in self._event_callbacks:
-                        for callback in self._event_callbacks[event_name]:
-                            try:
-                                callback(event)
-                            except Exception as e:
-                                logger.error(f"事件回调错误: {e}")
-            except Exception as e:
-                logger.error(f"事件接收错误: {e}")
-                break
-    
-    def on_event(self, event_name: str, callback: Callable):
-        if event_name not in self._event_callbacks:
-            self._event_callbacks[event_name] = []
-        self._event_callbacks[event_name].append(callback)
-    
-    async def api(self, command: str, arg: str = "") -> Optional[Any]:
-        if not self.conn:
-            return None
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(self.executor, self.conn.api, command, arg)
-    
-    async def send(self, command: str) -> bool:
-        if not self.conn:
-            return False
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(self.executor, self.conn.send, command)
-    
-    async def disconnect(self):
-        self._stop_event.set()
-        if self._event_thread:
-            self._event_thread.join(timeout=2)
-        if self.conn:
-            self.conn.disconnect()
-            self.conn = None
-        self.executor.shutdown(wait=False)
-
-# ========== 通话会话 ==========
-@dataclass
-class CallSession:
-    uuid: str
-    phone_number: str
-    ws: Optional[Any] = None
-    is_active: bool = False
-    is_ai_speaking: bool = False
-    is_user_speaking: bool = False
-    vad: VADDetector = field(default_factory=lambda: VADDetector(sample_rate=16000))
-    
-    # 音频累积
-    sentence_audio: Deque[np.ndarray] = field(default_factory=deque)
-    pending_sentence: bool = False  # 有待发送的整句
-    
-    start_time: float = field(default_factory=time.time)
-    last_activity: float = field(default_factory=time.time)
-    
-    # 统计
-    total_turns: int = 0
-    ai_talk_time: float = 0.0
-    user_talk_time: float = 0.0
-
-# ========== 主机器人类 ==========
-class OutboundCallBot:
-    def __init__(self, config: Config = CONFIG):
-        self.config = config
-        self.esl: Optional[AsyncESL] = None
-        self.sessions: Dict[str, CallSession] = {}
-        self.running = False
-        
-        os.makedirs(config.shm_dir, exist_ok=True)
-        os.makedirs(config.tts_dir, exist_ok=True)
-    
-    async def initialize(self) -> bool:
-        self.esl = AsyncESL(self.config.fs_host, self.config.fs_port, self.config.fs_pass)
-        
-        if not await self.esl.connect():
-            logger.error("无法连接 FreeSWITCH")
-            return False
-        
-        self.esl.on_event("CHANNEL_ANSWER", self._on_channel_answer)
-        self.esl.on_event("CHANNEL_HANGUP", self._on_channel_hangup)
-        
-        self.running = True
-        logger.info("机器人初始化完成")
-        return True
-    
-    def _on_channel_answer(self, event):
-        uuid = event.getHeader("Unique-ID")
-        phone = event.getHeader("Caller-Destination-Number")
-        logger.info(f"用户接听: UUID={uuid}, 号码={phone}")
-        
-        if uuid not in self.sessions:
-            self.sessions[uuid] = CallSession(uuid=uuid, phone_number=phone)
-        
-        self.sessions[uuid].is_active = True
-        asyncio.create_task(self._handle_call(uuid))
-    
-    def _on_channel_hangup(self, event):
-        uuid = event.getHeader("Unique-ID")
-        cause = event.getHeader("Hangup-Cause")
-        logger.info(f"用户挂断: UUID={uuid}, 原因={cause}")
-        
-        if uuid in self.sessions:
-            self.sessions[uuid].is_active = False
-    
-    async def originate_call(self, phone_number: str) -> Optional[str]:
-        cmd = (
-            f"{{origination_caller_id_number={self.config.caller_id}}}"
-            f"sofia/gateway/{self.config.gateway}/{phone_number} "
-            f"&park()"
-        )
-        
-        res = await self.esl.api("originate", cmd)
-        
-        if res:
-            reply = res.getBody() if hasattr(res, 'getBody') else str(res)
-            logger.info(f"originate 结果: {reply}")
-            
-            if "+OK" in reply or "Success" in reply:
-                parts = reply.strip().split()
-                if len(parts) >= 2:
-                    return parts[-1]
-        
-        logger.error(f"外呼失败: {res}")
-        return None
-    
-    async def _handle_call(self, uuid: str):
-        """处理单个通话的主循环"""
-        session = self.sessions.get(uuid)
-        if not session:
-            return
-        
-        try:
-            # 1. 连接 MiniCPM-o
-            ws = await self._connect_minicpmo()
-            if not ws:
-                await self._hangup(uuid, "MINICPMO_CONNECT_FAILED")
-                return
-            
-            session.ws = ws
-            
-            # 2. 初始化会话
-            if not await self._initialize_minicpmo_session(ws):
-                await self._hangup(uuid, "MINICPMO_SESSION_FAILED")
-                return
-            
-            # 3. 发送问候语（可选）
-            await self._send_greeting(session)
-            
-            # 4. 主轮询循环
-            await self._main_loop(session)
-            
-        except Exception as e:
-            logger.error(f"通话处理异常: {e}", exc_info=True)
-        finally:
-            await self._cleanup_session(uuid)
-    
-    async def _connect_minicpmo(self, max_retries: int = 3) -> Optional[Any]:
-        for attempt in range(max_retries):
-            try:
-                ws = await websockets.connect(
-                    self.config.minicpmo_ws_url,
-                    extra_headers={"Authorization": f"Bearer {self.config.minicpmo_api_key}"},
-                    ping_interval=20,
-                    ping_timeout=10
-                )
-                logger.info(f"MiniCPM-o 连接成功")
-                return ws
-            except Exception as e:
-                logger.warning(f"连接失败 ({attempt + 1}/{max_retries}): {e}")
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(2 ** attempt)
-        return None
-    
-    async def _initialize_minicpmo_session(self, ws) -> bool:
-        try:
-            # 等待 session.created
-            async for message in ws:
-                data = json.loads(message)
-                if data.get("type") == "session.created":
-                    break
-                elif data.get("type") == "error":
-                    logger.error(f"会话创建错误: {data}")
-                    return False
-            
-            # 发送配置
-            await ws.send(json.dumps({
-                "type": "session.update",
-                "session": {
-                    "instructions": KNOWLEDGE_BASE,
-                    "voice": "alloy",
-                    "input_audio_format": "pcm16",
-                    "output_audio_format": "pcm16",
-                    "input_audio_transcription": {
-                        "model": "whisper-1",
-                        "language": "zh"
-                    }
-                }
-            }))
-            
-            # 等待确认
-            async for message in ws:
-                data = json.loads(message)
-                if data.get("type") == "session.updated":
-                    logger.info("MiniCPM-o 会话初始化完成")
-                    return True
-                elif data.get("type") == "error":
-                    logger.error(f"会话更新错误: {data}")
-                    return False
-                    
-        except Exception as e:
-            logger.error(f"初始化异常: {e}")
-        return False
-    
-    async def _send_greeting(self, session: CallSession):
-        """发送问候语（文字方式，让 AI 生成语音）"""
-        if not session.ws:
-            return
-        
-        # 通过 text 方式让 AI 说问候语
-        await session.ws.send(json.dumps({
-            "type": "conversation.item.create",
-            "item": {
-                "type": "message",
-                "role": "user",
-                "content": [{"type": "input_text", "text": "请向客户打招呼并自我介绍"}]
-            }
-        }))
-        
-        await session.ws.send(json.dumps({
-            "type": "response.create"
-        }))
-    
-    async def _main_loop(self, session: CallSession):
-        """主轮询循环：录音 → VAD → 发送/打断 → 播放回复"""
-        uuid = session.uuid
-        chunk_ms = self.config.chunk_duration_ms
-        chunk_samples_8k = int(self.config.fs_sample_rate * chunk_ms / 1000)
-        
-        # 用于累积 8kHz 音频，重采样到 16kHz 后给 VAD
-        audio_8k_buffer = bytearray()
-        
-        # 启动 TTS 播放任务
-        tts_task = asyncio.create_task(self._tts_player(session))
-        
-        # 启动 WebSocket 消息处理任务
-        ws_task = asyncio.create_task(self._ws_message_handler(session))
-        
-        chunk_idx = 0
-        
-        while session.is_active and self.running:
-            try:
-                chunk_idx += 1
-                chunk_path = os.path.join(self.config.shm_dir, f"{uuid}_{chunk_idx}.wav")
-                
-                # 1. 录制 100ms 音频到内存文件
-                # FreeSWITCH uuid_record 支持 wav 格式，会自动写文件头
-                record_cmd = (
-                    f"uuid_record {uuid} start {chunk_path} "
-                    f"{self.config.fs_sample_rate} {chunk_ms}"
-                )
-                await self.esl.send(record_cmd)
-                
-                # 等待录音完成（100ms + 少量开销）
-                await asyncio.sleep(chunk_ms / 1000 + 0.02)
-                
-                # 停止录音
-                await self.esl.send(f"uuid_record {uuid} stop {chunk_path}")
-                
-                # 2. 读取音频文件
-                audio_8k = await self._read_audio_file(chunk_path)
-                
-                # 删除临时文件
-                try:
-                    os.remove(chunk_path)
-                except:
-                    pass
-                
-                if audio_8k is None or len(audio_8k) == 0:
-                    continue
-                
-                # 3. 解码 PCMU → float32
-                pcm_float_8k = AudioUtils.pcmu_decode(audio_8k)
-                
-                # 4. 重采样到 16kHz（VAD 和 MiniCPM-o 需要）
-                pcm_float_16k = AudioUtils.resample(
-                    pcm_float_8k, 
-                    self.config.fs_sample_rate, 
-                    self.config.minicpmo_sample_rate
-                )
-                
-                # 5. VAD 检测
-                vad_state, is_speech, is_sentence_end = session.vad.process(pcm_float_16k)
-                
-                # 6. 处理 VAD 状态
-                if is_speech and session.is_ai_speaking:
-                    # 用户说话时 AI 正在播放 → 打断
-                    logger.info(f"检测到用户打断 AI")
-                    await self._interrupt_ai(session)
-                    session.is_user_speaking = True
-                
-                elif is_sentence_end:
-                    # 检测到句子结束（停顿）
-                    logger.info(f"检测到用户停顿，句子结束")
-                    sentence_audio = session.vad.get_buffered_audio()
-                    
-                    if len(sentence_audio) > 0:
-                        # 发送整句给 MiniCPM-o
-                        await self._send_audio_to_ai(session, sentence_audio)
-                        session.total_turns += 1
-                
-                # 7. 更新活动时间
-                if is_speech:
-                    session.last_activity = time.time()
-                    session.user_talk_time += chunk_ms / 1000
-                
-                # 8. 检查通话超时
-                if time.time() - session.start_time > self.config.max_call_duration_sec:
-                    logger.info(f"通话超时")
-                    await self._send_text_to_ai(session, "客户，我们的通话时间快到了，请问还有其他问题吗？")
-                    await asyncio.sleep(5)
-                    await self._hangup(uuid, "NORMAL_CLEARING")
-                    break
-                
-                # 9. 检查长时间无活动（30秒）
-                if time.time() - session.last_activity > 30 and not session.is_ai_speaking:
-                    logger.info(f"30秒无活动，主动询问")
-                    await self._send_text_to_ai(session, "请问您还在吗？有什么可以帮您的？")
-                    session.last_activity = time.time()
-                    
-            except Exception as e:
-                logger.error(f"轮询异常: {e}", exc_info=True)
-                await asyncio.sleep(0.1)
-        
-        # 取消后台任务
-        tts_task.cancel()
-        ws_task.cancel()
-        
-        try:
-            await tts_task
-        except asyncio.CancelledError:
-            pass
-        try:
-            await ws_task
-        except asyncio.CancelledError:
-            pass
-    
-    async def _read_audio_file(self, path: str) -> Optional[bytes]:
-        """读取音频文件（wav 格式，跳过文件头）"""
-        loop = asyncio.get_event_loop()
-        
-        def _read():
-            try:
-                with open(path, 'rb') as f:
-                    data = f.read()
-                    if len(data) > 44:
-                        # 跳过 WAV 文件头（44字节标准头）
-                        return data[44:]
-                    return data
-            except Exception as e:
-                logger.error(f"读取音频文件失败: {e}")
-                return None
-        
-        return await loop.run_in_executor(None, _read)
-    
-    async def _send_audio_to_ai(self, session: CallSession, audio: np.ndarray):
-        """发送音频给 MiniCPM-o"""
-        if not session.ws or not session.ws.open:
-            return
-        
-        # 转 int16
-        pcm_int16 = AudioUtils.float_to_int16(audio)
-        
-        # base64 编码
-        audio_b64 = base64.b64encode(pcm_int16.tobytes()).decode()
-        
-        # 发送
-        await session.ws.send(json.dumps({
-            "type": "input_audio_buffer.append",
-            "audio": audio_b64
-        }))
-        
-        # 提交
-        await session.ws.send(json.dumps({
-            "type": "input_audio_buffer.commit"
-        }))
-        
-        logger.debug(f"发送音频: {len(audio)} samples")
-    
-    async def _send_text_to_ai(self, session: CallSession, text: str):
-        """发送文本给 MiniCPM-o（用于主动询问）"""
-        if not session.ws or not session.ws.open:
-            return
-        
-        await session.ws.send(json.dumps({
-            "type": "conversation.item.create",
-            "item": {
-                "type": "message",
-                "role": "user",
-                "content": [{"type": "input_text", "text": text}]
-            }
-        }))
-        
-        await session.ws.send(json.dumps({
-            "type": "response.create"
-        }))
-    
-    async def _interrupt_ai(self, session: CallSession):
-        """打断 AI 说话"""
-        if not session.is_ai_speaking:
-            return
-        
-        logger.info(f"打断 AI: UUID={session.uuid}")
-        session.is_ai_speaking = False
-        
-        # 1. 停止播放
-        await self.esl.api("uuid_break", session.uuid)
-        
-        # 2. 清空 AI 侧缓冲区
-        if session.ws and session.ws.open:
-            await session.ws.send(json.dumps({
-                "type": "input_audio_buffer.clear"
-            }))
-    
-    async def _tts_player(self, session: CallSession):
-        """TTS 音频播放器：从队列取音频并播放"""
-        while session.is_active and self.running:
-            try:
-                # 等待 TTS 音频
-                tts_item = await asyncio.wait_for(
-                    self._get_tts_audio(session),
-                    timeout=0.5
-                )
-                
-                if not tts_item or not session.is_active:
-                    continue
-                
-                audio_b64, is_last = tts_item
-                
-                # 如果用户正在说话，跳过播放（避免冲突）
-                if session.is_user_speaking:
-                    logger.debug("用户正在说话，跳过 TTS 播放")
-                    continue
-                
-                # 解码音频
-                pcm_int16 = np.frombuffer(base64.b64decode(audio_b64), dtype=np.int16)
-                pcm_float_16k = AudioUtils.int16_to_float(pcm_int16)
-                
-                # 重采样到 8kHz
-                pcm_float_8k = AudioUtils.resample(
-                    pcm_float_16k,
-                    self.config.minicpmo_sample_rate,
-                    self.config.fs_sample_rate
-                )
-                
-                # 编码为 PCMU
-                pcmu_data = AudioUtils.pcmu_encode(pcm_float_8k)
-                
-                # 创建 WAV 文件（FreeSWITCH 需要格式头）
-                wav_data = AudioUtils.create_wav_header(
-                    pcmu_data, 
-                    self.config.fs_sample_rate
-                ) + pcmu_data
-                
-                # 写入内存文件
-                tmp_file = os.path.join(
-                    self.config.tts_dir,
-                    f"tts_{session.uuid}_{int(time.time()*1000)}.wav"
-                )
-                
-                loop = asyncio.get_event_loop()
-                await loop.run_in_executor(None, self._write_file, tmp_file, wav_data)
-                
-                # 播放
-                session.is_ai_speaking = True
-                session.ai_talk_time += len(pcm_float_8k) / self.config.fs_sample_rate
-                
-                await self.esl.api("uuid_displace", f"{session.uuid} start {tmp_file} 0 mux")
-                
-                # 等待播放完成
-                duration = len(pcm_float_8k) / self.config.fs_sample_rate
-                await asyncio.sleep(duration)
-                
-                session.is_ai_speaking = False
-                
-                # 清理
-                try:
-                    os.remove(tmp_file)
-                except:
-                    pass
-                    
-            except asyncio.TimeoutError:
-                continue
-            except Exception as e:
-                logger.error(f"TTS 播放异常: {e}")
-                session.is_ai_speaking = False
-    
-    def _write_file(self, path: str, data: bytes):
-        with open(path, 'wb') as f:
-            f.write(data)
-    
-    async def _get_tts_audio(self, session: CallSession):
-        """从 WebSocket 消息队列获取 TTS 音频"""
-        # 这个队列由 _ws_message_handler 填充
-        if not hasattr(session, '_tts_queue'):
-            session._tts_queue = asyncio.Queue()
-        
-        return await session._tts_queue.get()
-    
-    async def _ws_message_handler(self, session: CallSession):
-        """处理 MiniCPM-o WebSocket 消息"""
-        if not hasattr(session, '_tts_queue'):
-            session._tts_queue = asyncio.Queue()
-        
-        ws = session.ws
-        
-        try:
-            async for message in ws:
-                if not session.is_active:
-                    break
-                
-                data = json.loads(message)
-                msg_type = data.get("type", "")
-                
-                if msg_type == "response.output_audio.delta":
-                    # TTS 音频片段
-                    audio_b64 = data.get("delta", "")
-                    if audio_b64:
-                        await session._tts_queue.put((audio_b64, False))
-                
-                elif msg_type == "response.output_audio.done":
-                    # 音频流结束标记
-                    await session._tts_queue.put((None, True))
-                
-                elif msg_type == "response.text.delta":
-                    text = data.get("delta", "")
-                    logger.info(f"AI 回复文本: {text}")
-                
-                elif msg_type == "conversation.item.input_audio_transcription.completed":
-                    transcript = data.get("transcript", "")
-                    logger.info(f"用户说: {transcript}")
-                
-                elif msg_type == "error":
-                    logger.error(f"MiniCPM-o 错误: {data}")
-                
-                elif msg_type == "session.updated":
-                    logger.debug("会话配置更新成功")
-                    
-        except websockets.exceptions.ConnectionClosed:
-            logger.warning("MiniCPM-o WebSocket 连接关闭")
-        except Exception as e:
-            logger.error(f"WebSocket 消息处理异常: {e}")
-    
-    async def _hangup(self, uuid: str, cause: str = "NORMAL_CLEARING"):
-        logger.info(f"挂断通话: UUID={uuid}, 原因={cause}")
-        await self.esl.api("uuid_kill", uuid)
-        if uuid in self.sessions:
-            self.sessions[uuid].is_active = False
-    
-    async def _cleanup_session(self, uuid: str):
-        session = self.sessions.get(uuid)
-        if not session:
-            return
-        
-        logger.info(f"清理会话: UUID={uuid}")
-        
-        # 关闭 WebSocket
-        if session.ws:
-            try:
-                await session.ws.close()
-            except:
-                pass
-        
-        # 清理临时文件
-        for d in [self.config.shm_dir, self.config.tts_dir]:
-            for f in os.listdir(d):
-                if f.startswith(uuid) or f.startswith(f"tts_{uuid}"):
-                    try:
-                        os.remove(os.path.join(d, f))
-                    except:
-                        pass
-        
-        if uuid in self.sessions:
-            del self.sessions[uuid]
-        
-        logger.info(f"会话清理完成: UUID={uuid}")
-    
-    async def shutdown(self):
-        logger.info("正在关闭机器人...")
-        self.running = False
-        
-        for uuid in list(self.sessions.keys()):
-            await self._hangup(uuid)
-            await self._cleanup_session(uuid)
-        
-        if self.esl:
-            await self.esl.disconnect()
-        
-        logger.info("机器人已关闭")
-
-# ========== 主程序 ==========
-async def main():
-    bot = OutboundCallBot()
-    
-    if not await bot.initialize():
-        logger.error("初始化失败")
-        return
-    
-    try:
-        phone_number = input("请输入要呼叫的号码 (或输入 'listen' 只监听来电): ").strip()
-        
-        if phone_number.lower() == 'listen':
-            logger.info("进入监听模式，等待来电...")
-            while bot.running:
-                await asyncio.sleep(1)
-        else:
-            uuid = await bot.originate_call(phone_number)
-            
-            if uuid:
-                logger.info(f"外呼已发起，等待接听... UUID={uuid}")
-                
-                while uuid in bot.sessions and bot.sessions[uuid].is_active:
-                    await asyncio.sleep(1)
-                
-                logger.info("通话结束")
-            else:
-                logger.error("外呼失败")
-    
-    except KeyboardInterrupt:
-        logger.info("收到中断信号")
-    finally:
-        await bot.shutdown()
-
-if __name__ == "__main__":
-    asyncio.run(main())
+	#!/usr/bin/env python3
+	"""
+	智能外呼机器人 - FreeSWITCH + MiniCPM-o 4.5
+	增强轮询方案：支持打断 + 停顿检测 + 伪全双工
+	依赖：
+	    pip install websockets numpy webrtcvad
+	    # FreeSWITCH 需要 mod_sndfile 支持 wav 格式
+	    # 需要 ESL 模块
+	"""
+	import asyncio
+	import json
+	import base64
+	import os
+	import time
+	import threading
+	import concurrent.futures
+	import logging
+	from typing import Optional, Dict, Any, Callable, Deque
+	from dataclasses import dataclass, field
+	from collections import deque
+	from enum import Enum, auto
+	import numpy as np
+	import websockets
+	try:
+	    import webrtcvad
+	    WEBRTC_VAD_AVAILABLE = True
+	except ImportError:
+	    WEBRTC_VAD_AVAILABLE = False
+	    print("警告: webrtcvad 未安装，将使用能量阈值 VAD。安装: pip install webrtcvad")
+	try:
+	    from ESL import ESLconnection
+	except ImportError:
+	    raise ImportError(
+	        "ESL 模块未安装。请执行：\n"
+	        "cd /usr/local/src/freeswitch/libs/esl/python\n"
+	        "sudo python3 setup.py install"
+	    )
+	# ========== 日志配置 ==========
+	logging.basicConfig(
+	    level=logging.INFO,
+	    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+	)
+	logger = logging.getLogger(__name__)
+	# ========== 配置 ==========
+	@dataclass
+	class Config:
+	    """全局配置"""
+	    # FreeSWITCH
+	    fs_host: str = "127.0.0.1"
+	    fs_port: int = 8021
+	    fs_pass: str = "ClueCon"
+	    fs_sample_rate: int = 8000      # FreeSWITCH 默认 8kHz
+	    # MiniCPM-o (请替换为你的真实 API 地址和 Key)
+	    minicpmo_ws_url: str = "wss://api.modelbest.cn/v1/realtime?mode=audio"
+	    minicpmo_api_key: str = "你的API_Key"
+	    minicpmo_sample_rate: int = 16000
+	    # 轮询参数 (修改为90ms，因为是VAD 30ms的整倍数，避免数据丢失)
+	    chunk_duration_ms: int = 90     
+	    max_sentence_silence_ms: int = 800  
+	    pre_buffer_ms: int = 300        
+	    # VAD
+	    vad_aggressiveness: int = 2     
+	    energy_threshold: float = 0.015 
+	    # 路径
+	    shm_dir: str = "/dev/shm/fs_bot"
+	    tts_dir: str = "/dev/shm/fs_tts"
+	    # 业务 (请替换为真实号码和网关)
+	    caller_id: str = "你的外显号码"
+	    gateway: str = "fxo-gateway"
+	    max_call_duration_sec: int = 600
+	CONFIG = Config()
+	# ========== 知识库 ==========
+	KNOWLEDGE_BASE = """
+	你是XX公司的专业客服代表，请严格遵循以下信息：
+	【公司介绍】
+	我们专注于企业级AI语音解决方案，核心产品MiniCPM-o系列全双工语音模型。
+	【话术要求】
+	- 语气亲切专业，像真人一样自然
+	- 每次回复控制在30秒以内
+	- 如果客户说"不需要"、"挂了"、"拜拜"等，礼貌结束对话
+	"""
+	# ========== 音频工具 ==========
+	class AudioUtils:
+	    """音频处理工具（统一使用 PCM16 格式，规避 PCMU 格式错位导致的白噪音）"""
+	    @staticmethod
+	    def pcmu_decode(data: bytes) -> np.ndarray:
+	        """PCMU 解码为 float32 [-1, 1] (仅用于读取 FS 录音)"""
+	        MULAW_BIAS = 33
+	        exp_lut = [0, 132, 396, 924, 1980, 4092, 8316, 16764]
+	        result = np.zeros(len(data), dtype=np.float32)
+	        for i, byte in enumerate(data):
+	            byte = ~byte & 0xFF
+	            sign = (byte & 0x80)
+	            exponent = (byte >> 4) & 0x07
+	            mantissa = byte & 0x0F
+	            sample = exp_lut[exponent] + (mantissa << (exponent + 3))
+	            if sign:
+	                sample = -sample
+	            result[i] = (sample - MULAW_BIAS) / 32768.0
+	        return result
+	    @staticmethod
+	    def resample(data: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
+	        """线性插值重采样"""
+	        if orig_sr == target_sr:
+	            return data
+	        ratio = target_sr / orig_sr
+	        new_length = int(len(data) * ratio)
+	        if new_length == 0:
+	            return np.array([], dtype=np.float32)
+	        old_indices = np.linspace(0, len(data) - 1, new_length)
+	        indices = old_indices.astype(np.int32)
+	        frac = old_indices - indices
+	        result = np.zeros(new_length, dtype=np.float32)
+	        for i in range(new_length):
+	            idx = min(indices[i], len(data) - 2)
+	            result[i] = data[idx] * (1 - frac[i]) + data[idx + 1] * frac[i]
+	        return result
+	    @staticmethod
+	    def float_to_int16(data: np.ndarray) -> np.ndarray:
+	        return (np.clip(data, -1.0, 1.0) * 32767).astype(np.int16)
+	    @staticmethod
+	    def int16_to_float(data: np.ndarray) -> np.ndarray:
+	        return data.astype(np.float32) / 32768.0
+	    @staticmethod
+	    def create_wav_header(data_len: int, sample_rate: int, channels: int = 1, bits: int = 16) -> bytes:
+	        """创建标准 PCM WAV 文件头"""
+	        byte_rate = sample_rate * channels * bits // 8
+	        block_align = channels * bits // 8
+	        header = b'RIFF'
+	        header += (36 + data_len).to_bytes(4, 'little')
+	        header += b'WAVE'
+	        header += b'fmt '
+	        header += (16).to_bytes(4, 'little')  
+	        header += (1).to_bytes(2, 'little')    # AudioFormat = 1 (PCM)
+	        header += channels.to_bytes(2, 'little')
+	        header += sample_rate.to_bytes(4, 'little')
+	        header += byte_rate.to_bytes(4, 'little')
+	        header += block_align.to_bytes(2, 'little')
+	        header += bits.to_bytes(2, 'little')
+	        header += b'data'
+	        header += data_len.to_bytes(4, 'little')
+	        return header
+	# ========== VAD 检测器 ==========
+	class VADState(Enum):
+	    SILENCE = auto()
+	    SPEECH = auto()
+	    SPEECH_END = auto()
+	class VADDetector:
+	    """VAD 检测器：修复帧对齐问题"""
+	    def __init__(self, sample_rate: int = 16000, frame_duration_ms: int = 30):
+	        self.sample_rate = sample_rate
+	        self.frame_duration_ms = frame_duration_ms
+	        self.frame_size = int(sample_rate * frame_duration_ms / 1000) # 480 samples
+	        self.vad = None
+	        if WEBRTC_VAD_AVAILABLE and sample_rate in (8000, 16000, 32000, 48000):
+	            self.vad = webrtcvad.Vad(CONFIG.vad_aggressiveness)
+	        self.energy_threshold = CONFIG.energy_threshold
+	        self.state = VADState.SILENCE
+	        self.silence_frames = 0
+	        self.speech_frames = 0
+	        self.max_silence_frames = int(CONFIG.max_sentence_silence_ms / frame_duration_ms)
+	        self.min_speech_frames = 3 
+	        self.audio_buffer: Deque[np.ndarray] = deque()
+	        self.pre_buffer: Deque[np.ndarray] = deque(maxlen=int(CONFIG.pre_buffer_ms / frame_duration_ms))
+	    def _process_single_frame(self, audio_frame: np.ndarray) -> tuple:
+	        """处理单个 30ms 的帧"""
+	        if len(audio_frame) < self.frame_size:
+	            audio_frame = np.pad(audio_frame, (0, self.frame_size - len(audio_frame)))
+	        pcm_int16 = AudioUtils.float_to_int16(audio_frame)
+	        is_speech = False
+	        if self.vad:
+	            try:
+	                is_speech = self.vad.is_speech(pcm_int16.tobytes(), self.sample_rate)
+	            except:
+	                is_speech = False
+	        if not is_speech:
+	            energy = np.sqrt(np.mean(audio_frame ** 2))
+	            is_speech = energy > self.energy_threshold
+	        # 状态机逻辑
+	        if is_speech:
+	            self.silence_frames = 0
+	            self.speech_frames += 1
+	            if self.state == VADState.SILENCE and self.speech_frames >= self.min_speech_frames:
+	                self.state = VADState.SPEECH
+	                self.audio_buffer.extend(self.pre_buffer)
+	                self.pre_buffer.clear()
+	            if self.state == VADState.SPEECH:
+	                self.audio_buffer.append(audio_frame)
+	            else:
+	                self.pre_buffer.append(audio_frame)
+	        else:
+	            self.speech_frames = 0
+	            self.silence_frames += 1
+	            if self.state == VADState.SPEECH:
+	                self.audio_buffer.append(audio_frame)
+	                if self.silence_frames >= self.max_silence_frames:
+	                    self.state = VADState.SPEECH_END
+	                    return VADState.SPEECH_END, False, True
+	            else:
+	                if len(self.pre_buffer) < self.pre_buffer.maxlen:
+	                    self.pre_buffer.append(audio_frame)
+	                self.state = VADState.SILENCE
+	        return self.state, is_speech, False
+	    def process(self, audio_chunk: np.ndarray) -> tuple:
+	        """处理较长的音频块(如90ms)，自动切分为30ms给VAD"""
+	        final_state = self.state
+	        has_speech = False
+	        is_end = False
+	        # 按 frame_size 切片处理
+	        for i in range(0, len(audio_chunk), self.frame_size):
+	            frame = audio_chunk[i:i+self.frame_size]
+	            if len(frame) == 0:
+	                continue
+	            s, speech, end = self._process_single_frame(frame)
+	            final_state = s
+	            if speech: has_speech = True
+	            if end: is_end = True
+	        return final_state, has_speech, is_end
+	    def get_buffered_audio(self) -> np.ndarray:
+	        if not self.audio_buffer:
+	            return np.array([], dtype=np.float32)
+	        result = np.concatenate(list(self.audio_buffer))
+	        self.audio_buffer.clear()
+	        self.state = VADState.SILENCE
+	        self.silence_frames = 0
+	        return result
+	    def reset(self):
+	        self.state = VADState.SILENCE
+	        self.silence_frames = 0
+	        self.speech_frames = 0
+	        self.audio_buffer.clear()
+	        self.pre_buffer.clear()
+	# ========== 异步 ESL 封装 ==========
+	class AsyncESL:
+	    """修复线程安全的异步 ESL"""
+	    def __init__(self, host: str, port: int, password: str, loop: asyncio.AbstractEventLoop):
+	        self.host = host
+	        self.port = port
+	        self.password = password
+	        self.conn: Optional[ESLconnection] = None
+	        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+	        self._loop = loop  # 保存主事件循环引用
+	        self._connected = False
+	        self._event_callbacks: Dict[str, list] = {}
+	        self._event_thread: Optional[threading.Thread] = None
+	        self._stop_event = threading.Event()
+	    async def connect(self) -> bool:
+	        def _connect():
+	            conn = ESLconnection(self.host, self.port, self.password)
+	            if conn.connected():
+	                conn.events("plain", "ALL")
+	                return conn
+	            return None
+	        self.conn = await self._loop.run_in_executor(self.executor, _connect)
+	        if self.conn:
+	            self._connected = True
+	            self._event_thread = threading.Thread(target=self._event_loop, daemon=True)
+	            self._event_thread.start()
+	            logger.info("FreeSWITCH ESL 连接成功")
+	            return True
+	        return False
+	    def _event_loop(self):
+	        while not self._stop_event.is_set() and self.conn:
+	            try:
+	                event = self.conn.recvEventTimed(100)
+	                if event:
+	                    event_name = event.getHeader("Event-Name")
+	                    if event_name in self._event_callbacks:
+	                        for callback in self._event_callbacks[event_name]:
+	                            try:
+	                                callback(event)
+	                            except Exception as e:
+	                                logger.error(f"事件回调错误: {e}")
+	            except Exception as e:
+	                logger.error(f"事件接收错误: {e}")
+	                break
+	    def on_event(self, event_name: str, callback: Callable):
+	        if event_name not in self._event_callbacks:
+	            self._event_callbacks[event_name] = []
+	        self._event_callbacks[event_name].append(callback)
+	    async def api(self, command: str, arg: str = "") -> Optional[Any]:
+	        if not self.conn: return None
+	        return await self._loop.run_in_executor(self.executor, self.conn.api, command, arg)
+	    async def send(self, command: str) -> bool:
+	        if not self.conn: return False
+	        return await self._loop.run_in_executor(self.executor, self.conn.send, command)
+	    async def disconnect(self):
+	        self._stop_event.set()
+	        if self._event_thread:
+	            self._event_thread.join(timeout=2)
+	        if self.conn:
+	            self.conn.disconnect()
+	            self.conn = None
+	        self.executor.shutdown(wait=False)
+	# ========== 通话会话 ==========
+	@dataclass
+	class CallSession:
+	    uuid: str
+	    phone_number: str
+	    ws: Optional[Any] = None
+	    is_active: bool = False
+	    is_ai_speaking: bool = False
+	    is_user_speaking: bool = False
+	    vad: VADDetector = field(default_factory=lambda: VADDetector(sample_rate=16000))
+	    sentence_audio: Deque[np.ndarray] = field(default_factory=deque)
+	    pending_sentence: bool = False 
+	    start_time: float = field(default_factory=time.time)
+	    last_activity: float = field(default_factory=time.time)
+	    total_turns: int = 0
+	    ai_talk_time: float = 0.0
+	    user_talk_time: float = 0.0
+	    # TTS队列直接初始化
+	    tts_queue: asyncio.Queue = field(default_factory=asyncio.Queue)
+	# ========== 主机器人类 ==========
+	class OutboundCallBot:
+	    def __init__(self, config: Config = CONFIG):
+	        self.config = config
+	        self.esl: Optional[AsyncESL] = None
+	        self.sessions: Dict[str, CallSession] = {}
+	        self.running = False
+	        self.loop: Optional[asyncio.AbstractEventLoop] = None
+	        os.makedirs(config.shm_dir, exist_ok=True)
+	        os.makedirs(config.tts_dir, exist_ok=True)
+	    async def initialize(self) -> bool:
+	        self.loop = asyncio.get_event_loop()
+	        self.esl = AsyncESL(self.config.fs_host, self.config.fs_port, self.config.fs_pass, self.loop)
+	        if not await self.esl.connect():
+	            logger.error("无法连接 FreeSWITCH")
+	            return False
+	        self.esl.on_event("CHANNEL_ANSWER", self._on_channel_answer)
+	        self.esl.on_event("CHANNEL_HANGUP", self._on_channel_hangup)
+	        self.running = True
+	        logger.info("机器人初始化完成")
+	        return True
+	    def _on_channel_answer(self, event):
+	        uuid = event.getHeader("Unique-ID")
+	        phone = event.getHeader("Caller-Destination-Number")
+	        logger.info(f"用户接听: UUID={uuid}, 号码={phone}")
+	        if uuid not in self.sessions:
+	            self.sessions[uuid] = CallSession(uuid=uuid, phone_number=phone)
+	        self.sessions[uuid].is_active = True
+	        # 修复：从后台线程安全提交异步任务
+	        asyncio.run_coroutine_threadsafe(self._handle_call(uuid), self.loop)
+	    def _on_channel_hangup(self, event):
+	        uuid = event.getHeader("Unique-ID")
+	        cause = event.getHeader("Hangup-Cause")
+	        logger.info(f"用户挂断: UUID={uuid}, 原因={cause}")
+	        if uuid in self.sessions:
+	            self.sessions[uuid].is_active = False
+	    async def originate_call(self, phone_number: str) -> Optional[str]:
+	        cmd = (
+	            f"{{origination_caller_id_number={self.config.caller_id}}}"
+	            f"sofia/gateway/{self.config.gateway}/{phone_number} "
+	            f"&park()"
+	        )
+	        res = await self.esl.api("originate", cmd)
+	        if res:
+	            reply = res.getBody() if hasattr(res, 'getBody') else str(res)
+	            if "+OK" in reply:
+	                return reply.strip().split()[-1]
+	        return None
+	    async def _handle_call(self, uuid: str):
+	        session = self.sessions.get(uuid)
+	        if not session: return
+	        try:
+	            ws = await self._connect_minicpmo()
+	            if not ws:
+	                await self._hangup(uuid, "CONNECT_FAILED")
+	                return
+	            session.ws = ws
+	            if not await self._initialize_minicpmo_session(ws):
+	                await self._hangup(uuid, "SESSION_FAILED")
+	                return
+	            await self._send_greeting(session)
+	            await self._main_loop(session)
+	        except Exception as e:
+	            logger.error(f"通话处理异常: {e}", exc_info=True)
+	        finally:
+	            await self._cleanup_session(uuid)
+	    async def _connect_minicpmo(self, max_retries: int = 3) -> Optional[Any]:
+	        for attempt in range(max_retries):
+	            try:
+	                ws = await websockets.connect(
+	                    self.config.minicpmo_ws_url,
+	                    extra_headers={"Authorization": f"Bearer {self.config.minicpmo_api_key}"},
+	                    ping_interval=20, ping_timeout=10
+	                )
+	                return ws
+	            except Exception as e:
+	                logger.warning(f"连接失败 ({attempt + 1}/{max_retries}): {e}")
+	                await asyncio.sleep(2 ** attempt)
+	        return None
+	    async def _initialize_minicpmo_session(self, ws) -> bool:
+	        try:
+	            async for message in ws:
+	                data = json.loads(message)
+	                if data.get("type") == "session.created": break
+	                elif data.get("type") == "error": return False
+	            await ws.send(json.dumps({
+	                "type": "session.update",
+	                "session": {
+	                    "instructions": KNOWLEDGE_BASE,
+	                    "voice": "alloy",
+	                    "input_audio_format": "pcm16",
+	                    "output_audio_format": "pcm16",
+	                    "input_audio_transcription": {"model": "whisper-1", "language": "zh"}
+	                }
+	            }))
+	            async for message in ws:
+	                data = json.loads(message)
+	                if data.get("type") == "session.updated": return True
+	                elif data.get("type") == "error": return False
+	        except Exception as e:
+	            logger.error(f"初始化异常: {e}")
+	        return False
+	    async def _send_greeting(self, session: CallSession):
+	        if not session.ws: return
+	        await session.ws.send(json.dumps({
+	            "type": "conversation.item.create",
+	            "item": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "请向客户打招呼并自我介绍"}]}
+	        }))
+	        await session.ws.send(json.dumps({"type": "response.create"}))
+	    async def _main_loop(self, session: CallSession):
+	        uuid = session.uuid
+	        chunk_ms = self.config.chunk_duration_ms
+	        tts_task = asyncio.create_task(self._tts_player(session))
+	        ws_task = asyncio.create_task(self._ws_message_handler(session))
+	        chunk_idx = 0
+	        while session.is_active and self.running:
+	            try:
+	                chunk_idx += 1
+	                chunk_path = os.path.join(self.config.shm_dir, f"{uuid}_{chunk_idx}.wav")
+	                # 修复：正确的 uuid_record 语法 (时间限制以秒为单位)
+	                record_cmd = f"uuid_record {uuid} start {chunk_path} {chunk_ms / 1000.0}"
+	                await self.esl.send(record_cmd)
+	                await asyncio.sleep(chunk_ms / 1000.0 + 0.03) # 留足写入时间
+	                await self.esl.send(f"uuid_record {uuid} stop {chunk_path}")
+	                audio_8k = await self._read_audio_file(chunk_path)
+	                try: os.remove(chunk_path)
+	                except: pass
+	                if audio_8k is None or len(audio_8k) == 0: continue
+	                pcm_float_8k = AudioUtils.pcmu_decode(audio_8k)
+	                pcm_float_16k = AudioUtils.resample(pcm_float_8k, self.config.fs_sample_rate, self.config.minicpmo_sample_rate)
+	                vad_state, is_speech, is_sentence_end = session.vad.process(pcm_float_16k)
+	                if is_speech and session.is_ai_speaking:
+	                    logger.info("检测到用户打断 AI")
+	                    await self._interrupt_ai(session)
+	                    session.is_user_speaking = True
+	                elif is_sentence_end:
+	                    logger.info("检测到用户停顿，句子结束")
+	                    sentence_audio = session.vad.get_buffered_audio()
+	                    if len(sentence_audio) > 0:
+	                        await self._send_audio_to_ai(session, sentence_audio)
+	                        session.total_turns += 1
+	                if is_speech:
+	                    session.last_activity = time.time()
+	                    session.is_user_speaking = True
+	                else:
+	                    session.is_user_speaking = False
+	                if time.time() - session.start_time > self.config.max_call_duration_sec:
+	                    await self._hangup(uuid, "TIMEOUT")
+	                    break
+	            except Exception as e:
+	                logger.error(f"轮询异常: {e}", exc_info=True)
+	                await asyncio.sleep(0.1)
+	        tts_task.cancel()
+	        ws_task.cancel()
+	    async def _read_audio_file(self, path: str) -> Optional[bytes]:
+	        def _read():
+	            try:
+	                with open(path, 'rb') as f:
+	                    data = f.read()
+	                    # 跳过标准 WAV 头 44 字节，提取 PCMU 裸流
+	                    return data[44:] if len(data) > 44 else None
+	            except: return None
+	        return await asyncio.get_event_loop().run_in_executor(None, _read)
+	    async def _send_audio_to_ai(self, session: CallSession, audio: np.ndarray):
+	        if not session.ws or not session.ws.open: return
+	        pcm_int16 = AudioUtils.float_to_int16(audio)
+	        audio_b64 = base64.b64encode(pcm_int16.tobytes()).decode()
+	        await session.ws.send(json.dumps({"type": "input_audio_buffer.append", "audio": audio_b64}))
+	        await session.ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
+	    async def _interrupt_ai(self, session: CallSession):
+	        if not session.is_ai_speaking: return
+	        session.is_ai_speaking = False
+	        await self.esl.api("uuid_break", session.uuid)
+	        # 清空积压的 TTS 队列
+	        while not session.tts_queue.empty():
+	            session.tts_queue.get_nowait()
+	        if session.ws and session.ws.open:
+	            await session.ws.send(json.dumps({"type": "input_audio_buffer.clear"}))
+	    async def _tts_player(self, session: CallSession):
+	        """修复：拼接完整的AI回复再播放，防止 uuid_displace 重叠冲突"""
+	        while session.is_active and self.running:
+	            try:
+	                # 收集单次回复的所有音频片段
+	                audio_chunks = []
+	                while True:
+	                    try:
+	                        item = await asyncio.wait_for(session.tts_queue.get(), timeout=0.5)
+	                    except asyncio.TimeoutError:
+	                        break # 超时无数据，继续外层循环检测状态
+	                    audio_b64, is_last = item
+	                    if audio_b64:
+	                        audio_chunks.append(base64.b64decode(audio_b64))
+	                    if is_last:
+	                        break
+	                if not audio_chunks or not session.is_active:
+	                    continue
+	                # 拼接并转换
+	                pcm_bytes = b''.join(audio_chunks)
+	                pcm_int16 = np.frombuffer(pcm_bytes, dtype=np.int16)
+	                pcm_float_16k = AudioUtils.int16_to_float(pcm_int16)
+	                pcm_float_8k = AudioUtils.resample(pcm_float_16k, self.config.minicpmo_sample_rate, self.config.fs_sample_rate)
+	                pcm_int16_8k = AudioUtils.float_to_int16(pcm_float_8k)
+	                pcm_bytes_8k = pcm_int16_8k.tobytes()
+	                # 写入标准 PCM16 WAV
+	                wav_data = AudioUtils.create_wav_header(len(pcm_bytes_8k), self.config.fs_sample_rate) + pcm_bytes_8k
+	                tmp_file = os.path.join(self.config.tts_dir, f"tts_{session.uuid}_{int(time.time()*1000)}.wav")
+	                with open(tmp_file, 'wb') as f: f.write(wav_data)
+	                # 播放
+	                session.is_ai_speaking = True
+	                await self.esl.api("uuid_displace", f"{session.uuid} start {tmp_file} 0 mux")
+	                # 按音频时长等待播放完毕
+	                duration = len(pcm_float_8k) / self.config.fs_sample_rate
+	                await asyncio.sleep(duration + 0.1) 
+	                session.is_ai_speaking = False
+	                try: os.remove(tmp_file)
+	                except: pass
+	            except Exception as e:
+	                logger.error(f"TTS 播放异常: {e}")
+	                session.is_ai_speaking = False
+	    async def _ws_message_handler(self, session: CallSession):
+	        ws = session.ws
+	        try:
+	            async for message in ws:
+	                if not session.is_active: break
+	                data = json.loads(message)
+	                msg_type = data.get("type", "")
+	                if msg_type == "response.output_audio.delta":
+	                    audio_b64 = data.get("delta", "")
+	                    if audio_b64:
+	                        await session.tts_queue.put((audio_b64, False))
+	                elif msg_type == "response.output_audio.done":
+	                    await session.tts_queue.put((None, True))
+	                elif msg_type == "response.text.delta":
+	                    logger.info(f"AI: {data.get('delta', '')}")
+	                elif msg_type == "conversation.item.input_audio_transcription.completed":
+	                    logger.info(f"用户: {data.get('transcript', '')}")
+	                elif msg_type == "error":
+	                    logger.error(f"API Error: {data}")
+	        except websockets.exceptions.ConnectionClosed:
+	            logger.warning("WebSocket 连接关闭")
+	        except Exception as e:
+	            logger.error(f"WS 异常: {e}")
+	    async def _hangup(self, uuid: str, cause: str = "NORMAL_CLEARING"):
+	        if uuid in self.sessions: self.sessions[uuid].is_active = False
+	        await self.esl.api("uuid_kill", uuid)
+	    async def _cleanup_session(self, uuid: str):
+	        session = self.sessions.get(uuid)
+	        if not session: return
+	        if session.ws:
+	            try: await session.ws.close()
+	            except: pass
+	        for d in [self.config.shm_dir, self.config.tts_dir]:
+	            for f in os.listdir(d):
+	                if uuid in f:
+	                    try: os.remove(os.path.join(d, f))
+	                    except: pass
+	        if uuid in self.sessions: del self.sessions[uuid]
+	    async def shutdown(self):
+	        self.running = False
+	        for uuid in list(self.sessions.keys()):
+	            await self._hangup(uuid)
+	            await self._cleanup_session(uuid)
+	        if self.esl: await self.esl.disconnect()
+	async def main():
+	    bot = OutboundCallBot()
+	    if not await bot.initialize(): return
+	    try:
+	        phone_number = input("请输入要呼叫的号码 (或输入 'listen' 只监听来电): ").strip()
+	        if phone_number.lower() == 'listen':
+	            while bot.running: await asyncio.sleep(1)
+	        else:
+	            uuid = await bot.originate_call(phone_number)
+	            if uuid:
+	                while uuid in bot.sessions and bot.sessions[uuid].is_active: await asyncio.sleep(1)
+	            else: logger.error("外呼失败")
+	    except KeyboardInterrupt: pass
+	    finally: await bot.shutdown()
+	if __name__ == "__main__":
+	    asyncio.run(main())
