@@ -88,6 +88,29 @@
 	from enum import Enum, auto
 	import numpy as np
 	import websockets
+
+    import struct
+
+	async def _read_audio_file(self, path: str) -> Optional[tuple]:
+	    """读取 WAV 文件，返回 (音频裸流, 格式代码)"""
+	    def _read():
+	        try:
+	            with open(path, 'rb') as f:
+	                data = f.read()
+	                if len(data) <= 44:
+	                    return None, None
+	                
+	                # 解析 WAV 头，获取真实的音频格式
+	                # 偏移量 20 处的 2 字节表示音频格式 (1=PCM, 6=PCMA, 7=PCMU)
+	                fmt_code = struct.unpack_from('<H', data, 20)[0]
+	                
+	                # 跳过标准 44 字节头（这里简化处理，未考虑附加块，但对 FS 默认录音足够）
+	                audio_data = data[44:]
+	                return audio_data, fmt_code
+	        except: 
+	            return None, None
+	    return await asyncio.get_event_loop().run_in_executor(None, _read)
+
 	try:
 	    import webrtcvad
 	    WEBRTC_VAD_AVAILABLE = True
@@ -102,7 +125,9 @@
 	        "cd /usr/local/src/freeswitch/libs/esl/python\n"
 	        "sudo python3 setup.py install"
 	    )
-	# ========== 日志配置 ==========
+
+
+    # ========== 日志配置 ==========
 	logging.basicConfig(
 	    level=logging.INFO,
 	    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
@@ -505,8 +530,26 @@
 	                audio_8k = await self._read_audio_file(chunk_path)
 	                try: os.remove(chunk_path)
 	                except: pass
-	                if audio_8k is None or len(audio_8k) == 0: continue
-	                pcm_float_8k = AudioUtils.pcmu_decode(audio_8k)
+
+                    #if audio_8k is None or len(audio_8k) == 0: continue
+	                #pcm_float_8k = AudioUtils.pcmu_decode(audio_8k)
+
+					audio_8k, fmt_code = await self._read_audio_file(chunk_path)
+					if audio_8k is None or len(audio_8k) == 0:
+					    continue
+					 
+					if fmt_code == 7: # PCMU
+					    pcm_float_8k = AudioUtils.pcmu_decode(audio_8k)
+					elif fmt_code == 1: # PCM16
+					    pcm_int16 = np.frombuffer(audio_8k, dtype=np.int16)
+					    pcm_float_8k = AudioUtils.int16_to_float(pcm_int16)
+					elif fmt_code == 6: # PCMA (需自行补充 PCMA 解码逻辑，原理同 PCMU)
+					    logger.warning("暂不支持 PCMA 解码")
+					    continue
+					else:
+					    logger.error(f"不支持的录音格式代码: {fmt_code}")
+					    continue
+
 	                pcm_float_16k = AudioUtils.resample(pcm_float_8k, self.config.fs_sample_rate, self.config.minicpmo_sample_rate)
 	                vad_state, is_speech, is_sentence_end = session.vad.process(pcm_float_16k)
 	                if is_speech and session.is_ai_speaking:
